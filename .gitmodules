@@ -1,3 +1,6 @@
 [submodule "api"]
 	path = api
 	url = https://github.com/KnowerBoye/ntentan-api.git
+[submodule "mobile"]
+	path = mobile
+	url = https://github.com/Mawuli-360/ntentan_mobile.git
