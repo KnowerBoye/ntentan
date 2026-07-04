@@ -9,8 +9,15 @@ This repository is a **monorepo** that combines both projects as Git submodules.
 
 ---
 
+## Demo Video
+
+[![Ntentan demo video](https://img.youtube.com/vi/8tS7mZt4zA4/maxresdefault.jpg)](https://youtu.be/8tS7mZt4zA4?si=srFwkVKOLvyPbYcF)
+
+---
+
 ## Table of Contents
 
+- [Demo Video](#demo-video)
 - [Architecture Overview](#architecture-overview)
 - [Prerequisites](#prerequisites)
 - [Getting Started](#getting-started)
