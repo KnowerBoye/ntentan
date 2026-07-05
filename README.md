@@ -13,6 +13,10 @@ This repository is a **monorepo** that combines both projects as Git submodules.
 
 [![Ntentan demo video](https://img.youtube.com/vi/8tS7mZt4zA4/maxresdefault.jpg)](https://youtu.be/8tS7mZt4zA4?si=srFwkVKOLvyPbYcF)
 
+**Presentation deck:** [canva.link/1p6p24bnsftp44h](https://canva.link/1p6p24bnsftp44h)
+
+**AI engineering deep-dive:** For a detailed look at the AI engineering stack — the real-time VLM streaming pipeline, agentic tool-calling assistant, semantic prescription matching over Firestore vector search, Twi voice pipeline, and the roadmap toward an in-house fine-tuned VLM — see [api/technical.md](./api/technical.md).
+
 ---
 
 ## Table of Contents
