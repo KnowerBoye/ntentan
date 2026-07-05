@@ -15,7 +15,7 @@ This repository is a **monorepo** that combines both projects as Git submodules.
 
 **Presentation deck:** [canva.link/1p6p24bnsftp44h](https://canva.link/1p6p24bnsftp44h)
 
-**AI engineering deep-dive:** For a detailed look at the AI engineering stack — the real-time VLM streaming pipeline, agentic tool-calling assistant, semantic prescription matching over Firestore vector search, Twi voice pipeline, and the roadmap toward an in-house fine-tuned VLM — see [api/technical.md](./api/technical.md).
+**AI engineering deep-dive:** For a detailed look at the AI engineering stack — the real-time VLM streaming pipeline, agentic tool-calling assistant, semantic prescription matching over Firestore vector search, Twi voice pipeline, and the roadmap toward an in-house fine-tuned VLM — see [docs/technical.md](./docs/technical.md).
 
 ---
 
