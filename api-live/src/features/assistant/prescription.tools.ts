@@ -1,9 +1,13 @@
 // ─────────────────────────────────────────────
 import { getFirestore } from "@/lib/firebase";
+import { FieldValue } from "firebase-admin/firestore";
 import {
   displayTime,
   displayTimeSlots,
   getNextDose,
+  buildMedicationDayView,
+  todayKey,
+  nowHHMM,
 } from "@/lib/DateHelpers";
 import {
   Prescription,
@@ -11,6 +15,11 @@ import {
   SavePrescriptionInput,
   SavePrescriptionResult,
   PrescriptionQueryResult,
+  MarkMedicationTakenInput,
+  MarkMedicationTakenResult,
+  TimeSlot,
+  VALID_SLOTS,
+  TIME_WINDOWS,
   ToolResult,
 } from "@/types/assistant";
 import { embedText } from "@/lib/embeddings";
@@ -20,7 +29,7 @@ import { logger } from "@/lib/logger";
  * Fetch all medications for a user from the subcollection:
  *   users/{userId}/medications
  */
-async function fetchAll(userId: string): Promise<Prescription[]> {
+export async function fetchAll(userId: string): Promise<Prescription[]> {
   const db = getFirestore();
   const snap = await db
     .collection("users")
@@ -81,7 +90,7 @@ function toVector(embedding: unknown): number[] | null {
  * Falls back to substring matching if vectors are unavailable.
  * If no drugName is provided, returns all medications.
  */
-async function matchDrugs(
+export async function matchDrugs(
   all: Prescription[],
   drugName?: string
 ): Promise<Prescription[]> {
@@ -135,9 +144,8 @@ export async function savePrescription(
     const { userId, name, timeSlots, dosage, unitsPerDose, frequency, strength, instruction } = input;
 
     // ── Validate timeSlots are valid ──
-    const VALID_SLOTS = ["morning", "afternoon", "evening"];
     for (const slot of timeSlots) {
-      if (!VALID_SLOTS.includes(slot)) {
+      if (!VALID_SLOTS.includes(slot as TimeSlot)) {
         return {
           success: false,
           error: `Invalid time slot "${slot}". Valid slots are: ${VALID_SLOTS.join(", ")}`,
@@ -157,7 +165,9 @@ export async function savePrescription(
       frequency,
       strength: strength ?? "",
       instruction: instruction ?? "",
-      completedSlots: {},
+      // Date-keyed intake log (see Completions type). Empty until a dose is
+      // marked taken.
+      completions: {},
       composite_string: `${name} ${strength ?? ""} ${dosage}`.trim(),
       createdAt: now,
       updatedAt: now,
@@ -273,6 +283,42 @@ export async function queryPrescriptions(
         break;
       }
 
+      case "today": {
+        const matched = drugName ? await matchDrugs(all, drugName) : all;
+        prescriptions = matched;
+
+        if (matched.length === 0) {
+          contextNote = drugName
+            ? `No medications found matching "${drugName}".`
+            : "No medications on record for today.";
+          break;
+        }
+
+        const today = todayKey();
+        const views = matched.map((p) => buildMedicationDayView(p, today));
+
+        // Spoken-friendly summary: group each med's slots by status.
+        const lines = views.map((v) => {
+          const parts = v.doses.map((d) => {
+            if (d.status === "taken") return `${d.slot} taken`;
+            if (d.status === "missed") return `${d.slot} missed`;
+            return `${d.slot} still due`;
+          });
+          return `${v.name} ${v.strength} — ${parts.join(", ")}`;
+        });
+
+        const totalDoses = views.reduce((n, v) => n + v.doses.length, 0);
+        const takenDoses = views.reduce(
+          (n, v) => n + v.doses.filter((d) => d.taken).length,
+          0
+        );
+
+        contextNote =
+          `Today's schedule (${takenDoses} of ${totalDoses} doses taken):\n` +
+          lines.join("\n");
+        break;
+      }
+
       default:
         return { success: false, error: `Unknown intent: ${intent}` };
     }
@@ -286,6 +332,122 @@ export async function queryPrescriptions(
       },
     };
   } catch (err) {
+    return { success: false, error: String(err) };
+  }
+}
+
+// ── Mark medication taken ────────────────────
+
+/** Resolve the slot that best matches "now" among a prescription's slots. */
+function currentSlotFor(p: Prescription): TimeSlot | null {
+  const now = nowHHMM();
+  const candidates = (p.timeSlots as TimeSlot[]).filter((s) => TIME_WINDOWS[s]);
+
+  // Prefer a slot whose window contains the current time.
+  const inWindow = candidates.find((s) => {
+    const w = TIME_WINDOWS[s];
+    return now >= w.start && now < w.end;
+  });
+  if (inWindow) return inWindow;
+
+  // Otherwise the earliest slot still not past its window end.
+  const upcoming = candidates
+    .filter((s) => now < TIME_WINDOWS[s].end)
+    .sort((a, b) => TIME_WINDOWS[a].start.localeCompare(TIME_WINDOWS[b].start));
+  if (upcoming.length) return upcoming[0];
+
+  // All windows passed → the latest slot of the day.
+  const sorted = candidates.sort((a, b) =>
+    TIME_WINDOWS[b].start.localeCompare(TIME_WINDOWS[a].start)
+  );
+  return sorted[0] ?? null;
+}
+
+/**
+ * Mark (or un-mark) a single dose of a medication as taken for a given day.
+ * Writes into the date-keyed `completions` map using a dotted field path so
+ * other slots/days are untouched.
+ */
+export async function markMedicationTaken(
+  input: MarkMedicationTakenInput
+): Promise<ToolResult<MarkMedicationTakenResult>> {
+  try {
+    const { userId, prescriptionId, drugName, date, taken = true } = input;
+
+    // ── Resolve the target prescription ──
+    let target: Prescription | undefined;
+
+    if (prescriptionId) {
+      const all = await fetchAll(userId);
+      target = all.find((p) => p.id === prescriptionId);
+      if (!target) {
+        return { success: false, error: `No medication found with id "${prescriptionId}".` };
+      }
+    } else if (drugName) {
+      const all = await fetchAll(userId);
+      const matched = await matchDrugs(all, drugName);
+      if (matched.length === 0) {
+        return { success: false, error: `No medication found matching "${drugName}".` };
+      }
+      if (matched.length > 1) {
+        const names = matched.map((p) => p.name).join(", ");
+        return {
+          success: false,
+          error: `"${drugName}" is ambiguous — it matched ${matched.length} medications (${names}). Ask the user which one they mean.`,
+        };
+      }
+      target = matched[0];
+    } else {
+      return { success: false, error: "Provide either prescriptionId or drugName." };
+    }
+
+    // ── Resolve the slot ──
+    const slot = input.slot ?? currentSlotFor(target);
+    if (!slot) {
+      return { success: false, error: `Could not determine a time slot for "${target.name}".` };
+    }
+    if (!(target.timeSlots as string[]).includes(slot)) {
+      return {
+        success: false,
+        error: `"${target.name}" is not scheduled for the ${slot} slot. Its slots are: ${displayTimeSlots(target.timeSlots)}.`,
+      };
+    }
+
+    const day = date ?? todayKey();
+    const db = getFirestore();
+    const docRef = db
+      .collection("users")
+      .doc(userId)
+      .collection("medications")
+      .doc(target.id);
+
+    const fieldPath = `completions.${day}.${slot}`;
+    if (taken) {
+      await docRef.update({
+        [fieldPath]: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    } else {
+      await docRef.update({
+        [fieldPath]: FieldValue.delete(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    logger.info("Medication intake updated", {
+      userId,
+      prescriptionId: target.id,
+      slot,
+      day,
+      taken,
+    });
+
+    return {
+      success: true,
+      data: { id: target.id, name: target.name, slot, date: day, taken },
+    };
+  } catch (err) {
+    logger.error("Failed to mark medication taken", { error: String(err) });
     return { success: false, error: String(err) };
   }
 }

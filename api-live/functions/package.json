@@ -1,0 +1,26 @@
+{
+  "name": "functions",
+  "description": "Cloud Functions for the Ntentan Live API",
+  "type": "commonjs",
+  "scripts": {
+    "serve": "firebase emulators:start --only functions",
+    "shell": "firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
+  },
+  "engines": {
+    "node": "22"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "@google/genai": "^2.8.0",
+    "dotenv": "^17.4.2",
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.6.0"
+  },
+  "devDependencies": {
+    "firebase-functions-test": "^3.1.0"
+  },
+  "private": true
+}

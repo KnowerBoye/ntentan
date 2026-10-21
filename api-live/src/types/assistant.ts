@@ -1,8 +1,23 @@
 import type { VectorValue } from "@google-cloud/firestore";
 
+/**
+ * Date-keyed intake log. Outer key is a local calendar day "YYYY-MM-DD";
+ * inner key is a time slot ("morning" | "afternoon" | "evening") mapped to the
+ * ISO timestamp at which that dose was marked taken.
+ *
+ *   completions: { "2026-10-21": { morning: "2026-10-21T07:12:00.000Z" } }
+ */
+export type Completions = Record<string, Record<string, string>>;
+
 export interface Prescription {
   id: string;
-  completedSlots: Record<string, string>; // slot name → timestamp
+  /** Date-keyed record of which slots were taken on which day. */
+  completions?: Completions;
+  /**
+   * @deprecated Legacy flat slot→timestamp map (no date dimension). Retained so
+   * old documents still parse; superseded by `completions`.
+   */
+  completedSlots?: Record<string, string>;
   composite_string: string;          // enriched text for semantic search
   createdAt: string;
   dosage: string;                    // e.g. "2 tablets"
@@ -25,15 +40,66 @@ export const TIME_WINDOWS: Record<string, { label: string; start: string; end: s
 
 // ── Query intent Gemini resolves ─────────────
 export type QueryIntent =
-  | "next"             // what medication should I take next (based on current time vs time slots)?
-  | "medication_info"  // find a specific medication and return its details (instruction, timeSlots, etc.)
-  | "all_active";      // list all my prescriptions
+  | "next"             // what medication should I take next (based on current time, skipping doses already taken today)?
+  | "medication_info"  // find a specific medication and return its details (instruction, timeSlots, dosage, etc.)
+  | "all_active"       // list all my prescriptions
+  | "today";           // today's schedule with taken / not-taken status for each slot
 
 export interface QueryPrescriptionsInput {
   userId: string;
   intent: QueryIntent;
   /** Drug name to filter by (uses semantic vector search) */
   drugName?: string;
+}
+
+// ── Time slots ───────────────────────────────
+export type TimeSlot = "morning" | "afternoon" | "evening";
+export const VALID_SLOTS: TimeSlot[] = ["morning", "afternoon", "evening"];
+
+// ── Mark medication taken ────────────────────
+export interface MarkMedicationTakenInput {
+  userId: string;
+  /** Which medication. Resolved by drugName (semantic match) when no id given. */
+  prescriptionId?: string;
+  drugName?: string;
+  /** Slot being marked. Omit to mark the current time-of-day slot. */
+  slot?: TimeSlot;
+  /** Local calendar day "YYYY-MM-DD". Defaults to today. */
+  date?: string;
+  /** false → un-mark (undo) the slot instead of marking it taken. Default true. */
+  taken?: boolean;
+}
+
+export interface MarkMedicationTakenResult {
+  id: string;
+  name: string;
+  slot: TimeSlot;
+  date: string;
+  taken: boolean;
+}
+
+// ── Today's schedule ─────────────────────────
+export interface DoseStatus {
+  slot: TimeSlot;
+  label: string;          // e.g. "Morning (06:00–12:00)"
+  taken: boolean;
+  takenAt?: string;       // ISO timestamp when marked
+  status: "taken" | "upcoming" | "missed"; // missed = window passed, not taken
+}
+
+export interface MedicationDayView {
+  id: string;
+  name: string;
+  strength: string;
+  dosage: string;
+  unitsPerDose: number;
+  instruction: string;
+  doses: DoseStatus[];
+}
+
+export interface TodayScheduleResult {
+  date: string;
+  medications: MedicationDayView[];
 }
 
 // ── Save Prescription ────────────────────────
@@ -51,6 +117,30 @@ export interface SavePrescriptionInput {
 export interface SavePrescriptionResult {
   id: string;
   name: string;
+}
+
+// ── Portal CRUD (caregiver web portal) ───────
+/** Fields a caregiver can set/update on a prescription. */
+export interface PrescriptionFields {
+  name: string;
+  timeSlots: string[];
+  dosage: string;
+  unitsPerDose: number;
+  frequency: number;
+  strength?: string;
+  instruction?: string;
+}
+
+export interface UpdatePrescriptionInput {
+  userId: string;
+  prescriptionId: string;
+  /** Partial set of fields to change. */
+  fields: Partial<PrescriptionFields>;
+}
+
+export interface DeletePrescriptionInput {
+  userId: string;
+  prescriptionId: string;
 }
 
 // ── Shared tool result ───────────────────────

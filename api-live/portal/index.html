@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ntentan · Caregiver Portal</title>
+  <style>
+    :root {
+      --bg: #0f1420;
+      --panel: #171e2e;
+      --panel-2: #1e2740;
+      --line: #2a3350;
+      --text: #e8ecf5;
+      --muted: #94a0bd;
+      --accent: #4f8cff;
+      --accent-2: #38d39f;
+      --danger: #ff6b6b;
+      --warn: #ffb648;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      background: linear-gradient(180deg, #182036, #11182a);
+      border-bottom: 1px solid var(--line);
+      padding: 18px 24px;
+      position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { margin: 0 0 2px; font-size: 18px; letter-spacing: .2px; }
+    header p { margin: 0; color: var(--muted); font-size: 13px; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 24px; }
+    .bar {
+      display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: var(--radius); padding: 16px; margin-bottom: 22px;
+    }
+    .field { display: flex; flex-direction: column; gap: 5px; }
+    .field label { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+    input, select, textarea {
+      background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+      border-radius: 8px; padding: 9px 11px; font-size: 14px; font-family: inherit;
+    }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+    input[type="number"] { width: 90px; }
+    button {
+      background: var(--accent); color: #fff; border: none; border-radius: 8px;
+      padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+      font-family: inherit; transition: filter .15s;
+    }
+    button:hover { filter: brightness(1.08); }
+    button.ghost { background: transparent; border: 1px solid var(--line); color: var(--muted); }
+    button.sm { padding: 6px 11px; font-size: 13px; }
+    button.danger { background: var(--danger); }
+    button.ok { background: var(--accent-2); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+    @media (max-width: 880px) { .grid { grid-template-columns: 1fr; } }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .panel > h2 {
+      margin: 0; font-size: 14px; padding: 14px 18px; border-bottom: 1px solid var(--line);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .panel-body { padding: 16px 18px; }
+    .med {
+      border: 1px solid var(--line); border-radius: 10px; padding: 13px 14px; margin-bottom: 12px;
+      background: var(--panel-2);
+    }
+    .med h3 { margin: 0 0 3px; font-size: 15px; }
+    .med .meta { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+    .slots { display: flex; gap: 7px; flex-wrap: wrap; }
+    .chip {
+      font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line);
+      color: var(--muted); text-transform: capitalize;
+    }
+    .dose {
+      display: flex; align-items: center; gap: 8px; padding: 7px 0;
+      border-top: 1px dashed var(--line);
+    }
+    .dose:first-child { border-top: none; }
+    .dose .state { font-size: 12px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+    .state.taken { background: rgba(56,211,159,.15); color: var(--accent-2); }
+    .state.upcoming { background: rgba(79,140,255,.15); color: var(--accent); }
+    .state.missed { background: rgba(255,107,107,.15); color: var(--danger); }
+    .dose .label { flex: 1; text-transform: capitalize; font-size: 14px; }
+    .row-actions { display: flex; gap: 7px; margin-top: 10px; }
+    form .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    form .full { grid-column: 1 / -1; }
+    .slotpick { display: flex; gap: 14px; }
+    .slotpick label { display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--text); text-transform: capitalize; }
+    .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
+    .toast {
+      position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+      background: var(--panel-2); border: 1px solid var(--line); padding: 11px 18px;
+      border-radius: 10px; font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none;
+      max-width: 90%;
+    }
+    .toast.show { opacity: 1; }
+    .toast.err { border-color: var(--danger); color: #ffd4d4; }
+    .summary { color: var(--muted); font-size: 12px; font-weight: 400; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🩺 Ntentan · Caregiver Portal</h1>
+    <p>Manage a patient's prescriptions and daily intake. Demo tool for caregivers &amp; medical professionals.</p>
+  </header>
+
+  <div class="wrap">
+    <div class="bar">
+      <div class="field" style="flex:1; min-width:220px;">
+        <label for="uid">Patient User ID (uid)</label>
+        <input id="uid" placeholder="Firebase uid of the patient" />
+      </div>
+      <div class="field">
+        <label for="apiBase">API base (optional)</label>
+        <input id="apiBase" placeholder="(same origin)" style="width:200px;" />
+      </div>
+      <button id="loadBtn">Load patient</button>
+    </div>
+
+    <div class="grid">
+      <!-- Manage prescriptions -->
+      <div class="panel">
+        <h2>Prescriptions <button class="sm ghost" id="newBtn">+ New</button></h2>
+        <div class="panel-body">
+          <form id="rxForm" style="display:none;">
+            <input type="hidden" id="rxId" />
+            <div class="form-grid">
+              <div class="field full">
+                <label>Medication name</label>
+                <input id="f_name" required placeholder="e.g. Paracetamol" />
+              </div>
+              <div class="field">
+                <label>Dosage form</label>
+                <input id="f_dosage" required placeholder="e.g. tablets" />
+              </div>
+              <div class="field">
+                <label>Strength (optional)</label>
+                <input id="f_strength" placeholder="e.g. 500mg" />
+              </div>
+              <div class="field">
+                <label>Units per dose</label>
+                <input id="f_units" type="number" min="0" step="0.5" required placeholder="2" />
+              </div>
+              <div class="field">
+                <label>Frequency / day</label>
+                <input id="f_freq" type="number" min="1" step="1" required placeholder="3" />
+              </div>
+              <div class="field full">
+                <label>Time slots</label>
+                <div class="slotpick">
+                  <label><input type="checkbox" value="morning" class="f_slot" /> Morning</label>
+                  <label><input type="checkbox" value="afternoon" class="f_slot" /> Afternoon</label>
+                  <label><input type="checkbox" value="evening" class="f_slot" /> Evening</label>
+                </div>
+              </div>
+              <div class="field full">
+                <label>Instructions (optional)</label>
+                <textarea id="f_instruction" rows="2" placeholder="e.g. Take with food"></textarea>
+              </div>
+            </div>
+            <div class="row-actions">
+              <button type="submit" id="saveBtn">Save</button>
+              <button type="button" class="ghost" id="cancelBtn">Cancel</button>
+            </div>
+          </form>
+          <div id="rxList"></div>
+        </div>
+      </div>
+
+      <!-- Today's schedule -->
+      <div class="panel">
+        <h2>Today's Schedule <span class="summary" id="daySummary"></span></h2>
+        <div class="panel-body">
+          <div class="field" style="margin-bottom:14px;">
+            <label>Date</label>
+            <input id="dayDate" type="date" />
+          </div>
+          <div id="dayList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { uid: "", apiBase: "", meds: [] };
+
+    // ── API helper ──
+    async function api(method, path, body) {
+      if (!state.uid) throw new Error("Enter a patient uid first.");
+      const headers = { "X-User-Id": state.uid };
+      if (body) headers["Content-Type"] = "application/json";
+      const res = await fetch(state.apiBase + "/api/prescriptions" + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || json.status === "error") {
+        throw new Error(json.message || json.error || `Request failed (${res.status})`);
+      }
+      return json.data;
+    }
+
+    function toast(msg, isErr) {
+      const t = $("toast");
+      t.textContent = msg;
+      t.className = "toast show" + (isErr ? " err" : "");
+      setTimeout(() => (t.className = "toast"), 2800);
+    }
+
+    function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c])); }
+
+    // ── Load everything for a patient ──
+    async function loadPatient() {
+      state.uid = $("uid").value.trim();
+      state.apiBase = $("apiBase").value.trim().replace(/\/$/, "");
+      if (!state.uid) return toast("Enter a patient uid.", true);
+      try {
+        await Promise.all([loadMeds(), loadDay()]);
+        toast("Patient loaded.");
+      } catch (e) { toast(e.message, true); }
+    }
+
+    // ── Prescriptions list ──
+    async function loadMeds() {
+      state.meds = await api("GET", "/");
+      renderMeds();
+    }
+
+    function renderMeds() {
+      const el = $("rxList");
+      if (!state.meds.length) { el.innerHTML = '<div class="empty">No prescriptions yet. Click “+ New” to add one.</div>'; return; }
+      el.innerHTML = state.meds.map(m => `
+        <div class="med">
+          <h3>${esc(m.name)} ${esc(m.strength || "")}</h3>
+          <div class="meta">${esc(m.unitsPerDose)} ${esc(m.dosage)} · ${esc(m.frequency)}×/day${m.instruction ? " · " + esc(m.instruction) : ""}</div>
+          <div class="slots">${(m.timeSlots||[]).map(s => `<span class="chip">${esc(s)}</span>`).join("")}</div>
+          <div class="row-actions">
+            <button class="sm ghost" onclick="editMed('${m.id}')">Edit</button>
+            <button class="sm danger" onclick="deleteMed('${m.id}')">Delete</button>
+          </div>
+        </div>`).join("");
+    }
+
+    // ── Today's schedule ──
+    async function loadDay() {
+      const date = $("dayDate").value;
+      const data = await api("GET", "/today" + (date ? "?date=" + date : ""));
+      renderDay(data);
+    }
+
+    function renderDay(data) {
+      const el = $("dayList");
+      const meds = data.medications || [];
+      let taken = 0, total = 0;
+      meds.forEach(m => m.doses.forEach(d => { total++; if (d.taken) taken++; }));
+      $("daySummary").textContent = total ? `${taken}/${total} doses taken` : "";
+      if (!meds.length) { el.innerHTML = '<div class="empty">No medications scheduled.</div>'; return; }
+      el.innerHTML = meds.map(m => `
+        <div class="med">
+          <h3>${esc(m.name)} ${esc(m.strength || "")}</h3>
+          <div class="meta">${esc(m.unitsPerDose)} ${esc(m.dosage)}</div>
+          ${m.doses.map(d => `
+            <div class="dose">
+              <span class="state ${d.status}">${d.status}</span>
+              <span class="label">${esc(d.slot)}${d.takenAt ? " · " + new Date(d.takenAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : ""}</span>
+              <button class="sm ${d.taken ? "ghost" : "ok"}" onclick="toggleTaken('${m.id}','${d.slot}',${!d.taken})">
+                ${d.taken ? "Undo" : "Mark taken"}
+              </button>
+            </div>`).join("")}
+        </div>`).join("");
+    }
+
+    async function toggleTaken(id, slot, taken) {
+      try {
+        const date = $("dayDate").value || undefined;
+        await api("POST", `/${id}/taken`, { slot, taken, date });
+        await loadDay();
+        toast(taken ? "Marked taken." : "Undone.");
+      } catch (e) { toast(e.message, true); }
+    }
+
+    // ── Create / edit form ──
+    function showForm(med) {
+      $("rxForm").style.display = "block";
+      $("rxId").value = med?.id || "";
+      $("f_name").value = med?.name || "";
+      $("f_dosage").value = med?.dosage || "";
+      $("f_strength").value = med?.strength || "";
+      $("f_units").value = med?.unitsPerDose ?? "";
+      $("f_freq").value = med?.frequency ?? "";
+      $("f_instruction").value = med?.instruction || "";
+      const slots = med?.timeSlots || [];
+      document.querySelectorAll(".f_slot").forEach(cb => (cb.checked = slots.includes(cb.value)));
+      $("saveBtn").textContent = med ? "Update" : "Save";
+    }
+
+    function hideForm() { $("rxForm").style.display = "none"; $("rxForm").reset?.(); }
+
+    window.editMed = (id) => { const m = state.meds.find(x => x.id === id); if (m) { showForm(m); window.scrollTo({top:0,behavior:'smooth'}); } };
+
+    window.deleteMed = async (id) => {
+      const m = state.meds.find(x => x.id === id);
+      if (!confirm(`Delete "${m?.name}"? This cannot be undone.`)) return;
+      try { await api("DELETE", "/" + id); await Promise.all([loadMeds(), loadDay()]); toast("Deleted."); }
+      catch (e) { toast(e.message, true); }
+    };
+
+    $("rxForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const slots = [...document.querySelectorAll(".f_slot:checked")].map(cb => cb.value);
+      if (!slots.length) return toast("Pick at least one time slot.", true);
+      const body = {
+        name: $("f_name").value.trim(),
+        dosage: $("f_dosage").value.trim(),
+        strength: $("f_strength").value.trim() || undefined,
+        unitsPerDose: Number($("f_units").value),
+        frequency: Number($("f_freq").value),
+        timeSlots: slots,
+        instruction: $("f_instruction").value.trim() || undefined,
+      };
+      const id = $("rxId").value;
+      try {
+        if (id) await api("PATCH", "/" + id, body);
+        else await api("POST", "/", body);
+        hideForm();
+        await Promise.all([loadMeds(), loadDay()]);
+        toast(id ? "Prescription updated." : "Prescription added.");
+      } catch (err) { toast(err.message, true); }
+    });
+
+    $("loadBtn").addEventListener("click", loadPatient);
+    $("uid").addEventListener("keydown", (e) => { if (e.key === "Enter") loadPatient(); });
+    $("newBtn").addEventListener("click", () => showForm(null));
+    $("cancelBtn").addEventListener("click", hideForm);
+    $("dayDate").addEventListener("change", () => { if (state.uid) loadDay().catch(e => toast(e.message, true)); });
+
+    // Default date = today (local)
+    $("dayDate").value = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD
+  </script>
+</body>
+</html>

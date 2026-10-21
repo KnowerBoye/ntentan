@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import path from "path";
 import { Server } from "socket.io";
 import { createServer } from "http";
 
@@ -9,6 +10,7 @@ import { handleScannerLiveConnection } from "@features/medication-scanner/scanne
 import { socketAuthMiddleware } from "@middlewares/socket-auth.middleware";
 import { globalErrorHandler, notFoundHandler } from "@middlewares/error-handler.middleware";
 import medicalAlertRoutes from "@features/medical-alert/medical-alert.routes";
+import prescriptionRoutes from "@features/assistant/prescription.routes";
 import { logger } from "@/lib/logger";
 
 dotenv.config();
@@ -34,6 +36,15 @@ io.of("/scanner-live").on("connection", handleScannerLiveConnection);
 // ── Express routes ────────────────────────────
 // Medical alert is a plain REST/SMS feature — unchanged from the base API.
 app.use("/api/medical-alert", medicalAlertRoutes);
+
+// Prescription management REST API (backs the caregiver portal).
+app.use("/api/prescriptions", prescriptionRoutes);
+
+// Caregiver demo portal — static single-page app living at <project>/portal.
+// Resolved from the working directory (same convention as firebase.ts), which
+// is the project root in both `npm run dev` and `npm start`.
+const PORTAL_DIR = path.resolve(process.cwd(), "portal");
+app.use("/portal", express.static(PORTAL_DIR));
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", mode: "live" });

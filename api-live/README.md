@@ -28,6 +28,69 @@ mNotify SMS alert.
 
 ---
 
+## Medication tracking & caregiver portal
+
+This edition adds **daily intake tracking** on top of the medication records so
+the assistant (and a caregiver) can mark doses taken and see what's left today.
+
+### Schema change
+
+Each `users/{uid}/medications/{id}` document gains a date-keyed **`completions`**
+map (replacing the old flat, date-less `completedSlots`):
+
+```jsonc
+"completions": {
+  "2026-10-21": { "morning": "2026-10-21T07:12:00.000Z", "evening": "…" },
+  "2026-10-20": { "morning": "…" }
+}
+```
+
+A dose is "taken" for a day iff `completions[date][slot]` exists. Marking a dose
+writes a single dotted field path (`completions.<date>.<slot>`) so other
+slots/days are untouched — and because it changes neither `name` nor `dosage`,
+it never re-triggers the embedding Cloud Function (no write loop). Old docs with
+only `completedSlots` still parse; the field is retained but ignored.
+
+### New assistant tools / intents
+
+- **`query_prescriptions`** gains a **`today`** intent → today's schedule with
+  each slot resolved to **taken / upcoming / missed**. The **`next`** intent now
+  **skips doses already marked taken today**.
+- **`mark_medication_taken`** (new) → records (or, with `taken:false`, undoes) a
+  dose. Resolves the medication by `drugName` (semantic search) and defaults the
+  slot to the current time of day. Ambiguous names are rejected so the assistant
+  asks which one.
+
+### Caregiver portal
+
+A **static single-page portal** for a caregiver / medical professional is served
+at **`GET /portal`** (`api-live/portal/index.html`). Enter a patient's **uid**,
+then add/edit/delete prescriptions and mark today's doses taken. It talks to the
+REST API below using dev **UID mode** (`X-User-Id`), so set `ALLOW_UID_AUTH=true`.
+
+### Prescription REST API (`/api/prescriptions`)
+
+All routes use `authMiddleware` (Firebase token, or `X-User-Id` in dev UID mode).
+
+| Method & path | Purpose |
+| :------------ | :------ |
+| `GET /` | list all of the user's prescriptions |
+| `POST /` | create a prescription |
+| `PATCH /:id` | update selected fields |
+| `DELETE /:id` | delete a prescription |
+| `GET /today?date=YYYY-MM-DD` | day schedule with taken/upcoming/missed per slot (defaults to today) |
+| `POST /:id/taken` | body `{ slot, date?, taken? }` — mark (or undo) a dose |
+
+### Cloud Functions
+
+`api-live/functions/` is a self-contained Firebase Functions project (with
+`firebase.json` + `.firebaserc` at the `api-live` root) — an updated port of
+`../api/functions`. It hosts the same `embedMedicationOnWrite` trigger that
+enriches name+dosage into the semantic-search vector, kept in sync with the
+`completions` schema. Deploy with `cd functions && npm install && npm run deploy`.
+
+---
+
 ## Authentication
 
 By default both namespaces and the REST route require **Firebase JWT auth**
@@ -115,6 +178,10 @@ npx serve playground      # then open assistant-live.html / scanner-live.html
 
 Paste a valid Firebase ID token, **Connect**, and talk. For the scanner, **Start
 scanning** and point the camera at a medication label.
+
+The **caregiver portal** is served by the API itself — with the server running,
+open <http://localhost:8080/portal> (set `ALLOW_UID_AUTH=true`), enter a patient
+uid and manage their prescriptions / daily intake.
 
 ### Smoke test (no browser, no Firebase)
 

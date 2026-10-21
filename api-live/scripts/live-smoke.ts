@@ -53,10 +53,14 @@ async function main() {
     callbacks: {
       onopen: () => {
         console.log("→ session open; sending prompt…");
-        session.sendClientContent({
-          turns: [{ role: "user", parts: [{ text: "What medication should I take next?" }] }],
-          turnComplete: true,
-        });
+        // Defer: onopen can fire synchronously *during* ai.live.connect(),
+        // before the `session` const below has been assigned.
+        setTimeout(() => {
+          session.sendClientContent({
+            turns: [{ role: "user", parts: [{ text: "What medication should I take next?" }] }],
+            turnComplete: true,
+          });
+        }, 0);
       },
       onmessage: (m: LiveServerMessage) => {
         const names = m.toolCall?.functionCalls?.map((f) => f.name) ?? [];

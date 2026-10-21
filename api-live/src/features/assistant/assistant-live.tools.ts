@@ -11,11 +11,17 @@
 import { FunctionCall } from "@google/genai";
 
 import { tools } from "@features/assistant/assistant.tools";
-import { queryPrescriptions, savePrescription } from "@features/assistant/prescription.tools";
+import {
+  queryPrescriptions,
+  savePrescription,
+  markMedicationTaken,
+} from "@features/assistant/prescription.tools";
 import { searchDrugInfo } from "@features/assistant/drugInfo.tools";
 import {
   QueryPrescriptionsInput,
   SavePrescriptionInput,
+  MarkMedicationTakenInput,
+  TimeSlot,
   SearchDrugInfoInput,
 } from "@/types/assistant";
 
@@ -61,6 +67,16 @@ export async function dispatchTool(
       instruction: args.instruction as string | undefined,
     };
     return { result: await savePrescription(input), isSearch: false };
+  }
+
+  if (call.name === "mark_medication_taken") {
+    const input: MarkMedicationTakenInput = {
+      userId,
+      drugName: args.drugName as string | undefined,
+      slot: args.slot as TimeSlot | undefined,
+      taken: args.taken as boolean | undefined,
+    };
+    return { result: await markMedicationTaken(input), isSearch: false };
   }
 
   return {
