@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ntentan — Live Voice Assistant</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 0 auto; padding: 1.5rem; }
+  h1 { font-size: 1.25rem; }
+  .row { display: flex; gap: .5rem; margin-bottom: .5rem; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 220px; padding: .5rem; font: inherit; }
+  button { padding: .5rem 1rem; font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid #8884; }
+  button:disabled { opacity: .5; cursor: default; }
+  #mic.live { background: #e3342f; color: #fff; }
+  #status { font-size: .85rem; opacity: .8; margin: .5rem 0; }
+  #log { border: 1px solid #8884; border-radius: 8px; padding: .75rem; height: 48vh; overflow-y: auto; font-size: .9rem; }
+  .msg { margin: .35rem 0; padding: .4rem .6rem; border-radius: 8px; max-width: 85%; }
+  .user { background: #3490dc22; margin-left: auto; }
+  .model { background: #38c17222; }
+  .tool { font-size: .8rem; opacity: .75; font-style: italic; }
+  .sys { font-size: .8rem; opacity: .6; }
+  .srcs { font-size: .75rem; opacity: .7; }
+</style>
+</head>
+<body>
+  <h1>Ntentan — Live Voice Assistant <span class="sys">(Gemini Live API)</span></h1>
+
+  <div class="row">
+    <input id="server" type="text" value="http://localhost:8080" placeholder="Server URL" />
+  </div>
+  <div class="row">
+    <input id="uid" type="text" placeholder="User UID (dev: ALLOW_UID_AUTH)" />
+    <button id="connect">Connect</button>
+  </div>
+  <div class="row">
+    <button id="mic" disabled>🎤 Hold / tap to talk</button>
+    <input id="textIn" type="text" placeholder="…or type a message" disabled />
+    <button id="send" disabled>Send</button>
+  </div>
+  <div id="status">Not connected.</div>
+  <div id="log"></div>
+
+<script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+<script>
+const INPUT_RATE = 16000;   // server expects PCM16 mono @16kHz
+const OUTPUT_RATE = 24000;  // server sends PCM16 mono @24kHz
+
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+let socket = null;
+let micStream = null, inCtx = null, processor = null, micOn = false;
+let outCtx = null, nextPlayTime = 0, liveSources = [];
+let curUserLine = null, curModelLine = null;
+
+function line(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+function setStatus(t) { $("status").textContent = t; }
+
+// ── base64 helpers ──
+function b64encode(uint8) {
+  let s = "";
+  for (let i = 0; i < uint8.length; i += 0x8000)
+    s += String.fromCharCode.apply(null, uint8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function b64decode(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+// ── mic capture → downsample → PCM16 → emit ──
+function downsample(buf, inRate, outRate) {
+  if (outRate === inRate) return buf;
+  const ratio = inRate / outRate;
+  const outLen = Math.round(buf.length / ratio);
+  const out = new Float32Array(outLen);
+  let o = 0, i = 0;
+  while (o < outLen) {
+    const next = Math.round((o + 1) * ratio);
+    let sum = 0, cnt = 0;
+    for (; i < next && i < buf.length; i++) { sum += buf[i]; cnt++; }
+    out[o++] = cnt ? sum / cnt : 0;
+  }
+  return out;
+}
+function floatToPCM16(f32) {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+async function startMic() {
+  if (micOn) return;
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  inCtx = new AudioContext();
+  const src = inCtx.createMediaStreamSource(micStream);
+  processor = inCtx.createScriptProcessor(4096, 1, 1);
+  const sink = inCtx.createGain(); sink.gain.value = 0; // avoid echo
+  processor.onaudioprocess = (e) => {
+    if (!socket) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const down = downsample(input, inCtx.sampleRate, INPUT_RATE);
+    const pcm = floatToPCM16(down);
+    socket.emit("audio", { data: b64encode(new Uint8Array(pcm.buffer)) });
+  };
+  src.connect(processor); processor.connect(sink); sink.connect(inCtx.destination);
+  micOn = true;
+  $("mic").classList.add("live");
+  $("mic").textContent = "🔴 Listening — tap to stop";
+  setStatus("Listening…");
+}
+function stopMic() {
+  if (!micOn) return;
+  processor && processor.disconnect();
+  micStream && micStream.getTracks().forEach((t) => t.stop());
+  inCtx && inCtx.close();
+  socket && socket.emit("audio_end");
+  micOn = false;
+  $("mic").classList.remove("live");
+  $("mic").textContent = "🎤 Hold / tap to talk";
+  setStatus("Connected.");
+}
+
+// ── playback of 24kHz PCM16 ──
+function ensureOut() {
+  if (!outCtx) { outCtx = new AudioContext({ sampleRate: OUTPUT_RATE }); nextPlayTime = outCtx.currentTime; }
+}
+function playChunk(b64) {
+  ensureOut();
+  const bytes = b64decode(b64);
+  const pcm = new Int16Array(bytes.buffer);
+  const f32 = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 0x8000;
+  const buf = outCtx.createBuffer(1, f32.length, OUTPUT_RATE);
+  buf.copyToChannel(f32, 0);
+  const node = outCtx.createBufferSource();
+  node.buffer = buf; node.connect(outCtx.destination);
+  const start = Math.max(nextPlayTime, outCtx.currentTime);
+  node.start(start);
+  nextPlayTime = start + buf.duration;
+  liveSources.push(node);
+  node.onended = () => { liveSources = liveSources.filter((n) => n !== node); };
+}
+function flushPlayback() {
+  liveSources.forEach((n) => { try { n.stop(); } catch {} });
+  liveSources = [];
+  if (outCtx) nextPlayTime = outCtx.currentTime;
+}
+
+// ── connect ──
+$("connect").onclick = () => {
+  const url = $("server").value.trim();
+  const uid = $("uid").value.trim();
+  if (!uid) { setStatus("Enter a user UID first."); return; }
+  if (socket) socket.disconnect();
+
+  socket = io(url + "/assistant-live", { auth: { uid }, transports: ["websocket"] });
+
+  socket.on("connect", () => { setStatus("Socket connected, opening Gemini session…"); line("sys", "● socket connected"); });
+  socket.on("ready", () => {
+    setStatus("Connected. Ready to talk.");
+    line("sys", "● Gemini Live session ready");
+    ["mic", "textIn", "send"].forEach((id) => $(id).disabled = false);
+  });
+  socket.on("audio", (p) => playChunk(p.data));
+  socket.on("transcript", (p) => {
+    if (p.role === "user") {
+      if (!curUserLine) curUserLine = line("user", "");
+      curUserLine.textContent += p.text;
+    } else {
+      if (!curModelLine) curModelLine = line("model", "");
+      curModelLine.textContent += p.text;
+    }
+    log.scrollTop = log.scrollHeight;
+  });
+  socket.on("tool", (p) => line("tool", "🛠  running " + p.name + "…"));
+  socket.on("sources", (p) => line("srcs", "Sources: " + p.sources.join(", ")));
+  socket.on("interrupted", () => { flushPlayback(); line("sys", "⎚ interrupted (barge-in)"); });
+  socket.on("turn_complete", () => { curUserLine = null; curModelLine = null; });
+  socket.on("error", (e) => { line("sys", "⚠ error: " + (e?.message || e)); setStatus("Error: " + (e?.message || e)); });
+  socket.on("disconnect", (r) => { setStatus("Disconnected: " + r); line("sys", "● disconnected: " + r); ["mic", "textIn", "send"].forEach((id) => $(id).disabled = true); stopMic(); });
+};
+
+$("mic").onclick = () => (micOn ? stopMic() : startMic());
+$("send").onclick = () => {
+  const t = $("textIn").value.trim();
+  if (!t || !socket) return;
+  socket.emit("text", { text: t });
+  line("user", t);
+  $("textIn").value = "";
+};
+$("textIn").addEventListener("keydown", (e) => { if (e.key === "Enter") $("send").click(); });
+</script>
+</body>
+</html>

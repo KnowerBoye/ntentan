@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ntentan — Live Medication Scanner</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 560px; margin: 0 auto; padding: 1.25rem; }
+  h1 { font-size: 1.2rem; }
+  .row { display: flex; gap: .5rem; margin-bottom: .5rem; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 200px; padding: .5rem; font: inherit; }
+  button { padding: .5rem 1rem; font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid #8884; }
+  button:disabled { opacity: .5; }
+  video { width: 100%; border-radius: 10px; background: #000; }
+  #guide { font-size: 1.3rem; font-weight: 600; text-align: center; margin: .75rem 0; min-height: 1.6em; }
+  #instr { text-align: center; font-size: 2rem; }
+  #match { border: 1px solid #8884; border-radius: 8px; padding: .6rem; font-size: .9rem; display: none; }
+  #status { font-size: .8rem; opacity: .7; }
+  .ok { color: #38c172; } .warn { color: #e3a008; }
+</style>
+</head>
+<body>
+  <h1>Ntentan — Live Scanner <span style="font-size:.7em;opacity:.6">(Gemini Live)</span></h1>
+  <div class="row"><input id="server" type="text" value="http://localhost:8080" placeholder="Server URL" /></div>
+  <div class="row">
+    <input id="uid" type="text" placeholder="User UID (dev: ALLOW_UID_AUTH)" />
+    <button id="start">Start scanning</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+  <video id="video" playsinline muted></video>
+  <div id="instr"></div>
+  <div id="guide">Point the camera at a medication label.</div>
+  <div id="match"></div>
+  <div id="status">Idle.</div>
+
+<script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+<script>
+const ARROWS = {
+  move_up: "⬆️", move_down: "⬇️", move_left: "⬅️", move_right: "➡️",
+  rotate_left: "↺", rotate_right: "↻", flip: "🔄",
+  move_closer: "➕", move_farther: "➖", hold_still: "✋", none: ""
+};
+const $ = (id) => document.getElementById(id);
+let socket = null, stream = null, timer = null;
+const video = $("video"), canvas = document.createElement("canvas"), ctx = canvas.getContext("2d");
+
+// ── spoken-guidance playback (24 kHz PCM16, same format as /assistant-live) ──
+// Latest-wins, no-interrupt: the cue currently playing is allowed to finish;
+// cues sealed while it plays collapse to a single slot holding only the newest,
+// so the freshest guidance plays next and stale cues in between are skipped.
+const OUTPUT_RATE = 24000;
+let outCtx = null, incoming = [], pendingCue = null, currentNode = null;
+function b64decode(b64) {
+  const bin = atob(b64), u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+function ensureOut() {
+  if (!outCtx) outCtx = new AudioContext({ sampleRate: OUTPUT_RATE });
+  return outCtx;
+}
+function pushChunk(b64) {
+  const bytes = b64decode(b64);
+  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  const f32 = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 0x8000;
+  incoming.push(f32);
+}
+function endUtterance() {
+  if (!incoming.length) return;
+  let len = 0; incoming.forEach((p) => (len += p.length));
+  const cue = new Float32Array(len);
+  let off = 0; incoming.forEach((p) => { cue.set(p, off); off += p.length; });
+  incoming = [];
+  if (currentNode) pendingCue = cue;   // don't interrupt; keep only the newest
+  else playCue(cue);
+}
+function playCue(samples) {
+  const ctx = ensureOut();
+  const buf = ctx.createBuffer(1, samples.length, OUTPUT_RATE);
+  buf.copyToChannel(samples, 0);
+  const node = ctx.createBufferSource();
+  node.buffer = buf; node.connect(ctx.destination);
+  currentNode = node;
+  node.start();
+  node.onended = () => {
+    currentNode = null;
+    if (pendingCue) { const next = pendingCue; pendingCue = null; playCue(next); }
+  };
+}
+function stopPlayback() {
+  try { currentNode && currentNode.stop(); } catch {}
+  currentNode = null; pendingCue = null; incoming = [];
+}
+
+$("start").onclick = async () => {
+  const url = $("server").value.trim(), uid = $("uid").value.trim();
+  if (!uid) { $("status").textContent = "Enter a user UID first."; return; }
+
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+  video.srcObject = stream; await video.play();
+
+  socket = io(url + "/scanner-live", { auth: { uid }, transports: ["websocket"] });
+  socket.on("connect", () => { $("status").textContent = "Connected — streaming frames."; });
+  socket.on("response", (json) => render(JSON.parse(json)));
+  socket.on("audio", (p) => p?.data && pushChunk(p.data));
+  socket.on("speech_end", () => endUtterance());
+  socket.on("error", (e) => { $("status").textContent = "Error: " + (e?.message || e); });
+  socket.on("disconnect", (r) => { $("status").textContent = "Disconnected: " + r; stopPlayback(); });
+
+  // Stream ~1.5 frames/sec; the server throttles to its own tick.
+  timer = setInterval(() => {
+    if (!socket?.connected || !video.videoWidth) return;
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+    canvas.toBlob((blob) => blob && blob.arrayBuffer().then((buf) => socket.emit("frame", { buf })), "image/jpeg", 0.8);
+  }, 650);
+
+  $("start").disabled = true; $("stop").disabled = false;
+};
+
+$("stop").onclick = () => {
+  clearInterval(timer);
+  stream && stream.getTracks().forEach((t) => t.stop());
+  socket && socket.disconnect();
+  stopPlayback();
+  $("start").disabled = false; $("stop").disabled = true;
+  $("status").textContent = "Stopped.";
+};
+
+function render(r) {
+  if (r.status === "processing") { $("status").textContent = "Processing frame…"; return; }
+  $("instr").textContent = ARROWS[r.instruction] || "";
+  $("guide").textContent = r.guidance_text || "";
+  const m = $("match");
+  if (r.status === "success") {
+    $("guide").classList.add("ok");
+    if (r.prescription_match) {
+      const med = r.prescription_match.medication;
+      m.style.display = "block";
+      m.innerHTML = `✅ <b>${med.name}</b> ${med.strength || ""} — ${med.unitsPerDose} ${med.dosage}` +
+        `<br><span style="opacity:.7">distance ${r.prescription_match.distance.toFixed(3)} · ` +
+        `${r.prescription_match.withinThreshold ? "confident match" : "below threshold"}</span>`;
+    } else {
+      m.style.display = "block";
+      m.innerHTML = `<span class="warn">Label read, but no matching prescription on file.</span>`;
+    }
+  } else {
+    $("guide").classList.remove("ok");
+    m.style.display = "none";
+  }
+}
+</script>
+</body>
+</html>
