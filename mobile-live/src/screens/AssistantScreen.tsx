@@ -6,7 +6,7 @@ import { sizes, theme } from "../components/theme";
 import { DEMO_UID, SERVER_URL } from "../config";
 import { useLanguage } from "../context/language";
 import { announce, resetAnnouncements } from "../lib/a11y";
-import { EncodedPlayer, Player, Recorder } from "../lib/audio";
+import { EncodedPlayer, Player, PulseCue, Recorder } from "../lib/audio";
 
 interface Msg {
   id: number;
@@ -32,12 +32,18 @@ export function AssistantScreen() {
     "Tap the button to start talking with the assistant."
   );
   const [speaking, setSpeaking] = useState(false);
+  // Twi has no live VAD: after "Finish speaking" the user waits for the server
+  // to transcribe + reply. That gap is a loading state (not listening, not
+  // speaking) we signal audibly — see the PulseCue effect below.
+  const [waiting, setWaiting] = useState(false);
   const [messages, setMessages] = useState<Msg[]>([]);
 
   const socketRef = useRef<Socket | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
   const playerRef = useRef<Player | null>(null);
   const ttsRef = useRef<EncodedPlayer | null>(null);
+  // Audible "working…" cue for loading states a blind user can't see a spinner for.
+  const cueRef = useRef<PulseCue | null>(null);
   const idRef = useRef(0);
   const curUser = useRef<number | null>(null);
   const curModel = useRef<number | null>(null);
@@ -48,9 +54,24 @@ export function AssistantScreen() {
 
   useEffect(() => {
     resetAnnouncements();
-    return () => teardown();
+    cueRef.current = new PulseCue();
+    return () => {
+      teardown();
+      cueRef.current?.close();
+      cueRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Drive the loading cue: the assistant is "working but silent" while the
+  // socket/Gemini session is opening (connecting) or, in Twi, while a reply is
+  // being prepared (waiting). Suppress it whenever real audio is playing so the
+  // two never talk over each other.
+  const loading = (phase === "connecting" || waiting) && !speaking;
+  useEffect(() => {
+    if (loading) cueRef.current?.start();
+    else cueRef.current?.stop();
+  }, [loading]);
 
   function push(role: Msg["role"], text: string): number {
     const id = idRef.current++;
@@ -90,6 +111,7 @@ export function AssistantScreen() {
     setMessages([]);
     curUser.current = null;
     curModel.current = null;
+    setWaiting(false);
     endingRef.current = false;
     setPhase("connecting");
     setAndSay("Connecting…");
@@ -115,6 +137,7 @@ export function AssistantScreen() {
       ttsRef.current?.play(p.data).catch(() => {})
     );
     socket.on("transcript", (p: { role: "user" | "model"; text: string }) => {
+      setWaiting(false); // the reply has started arriving
       if (p.role === "user") {
         if (curUser.current == null) curUser.current = push("user", p.text);
         else appendTo(curUser.current, p.text);
@@ -130,11 +153,13 @@ export function AssistantScreen() {
       ttsRef.current?.flush();
     });
     socket.on("turn_complete", () => {
+      setWaiting(false);
       curUser.current = null;
       curModel.current = null;
     });
     socket.on("error", (e: { message?: string } | string) => {
       const msg = typeof e === "string" ? e : e?.message ?? "error";
+      setWaiting(false);
       push("sys", msg);
       setAndSay("Error: " + msg);
     });
@@ -143,6 +168,7 @@ export function AssistantScreen() {
       if (endingRef.current) return;
       setPhase("idle");
       setSpeaking(false);
+      setWaiting(false);
       setAndSay("Conversation ended. " + (typeof r === "string" ? r : ""));
     });
   }
@@ -180,6 +206,7 @@ export function AssistantScreen() {
     teardown();
     setPhase("idle");
     setSpeaking(false);
+    setWaiting(false);
     setAndSay("Conversation ended. Tap to start again.");
   }
 
@@ -187,6 +214,7 @@ export function AssistantScreen() {
   function finishTurn() {
     ttsRef.current?.flush(); // no live barge-in in Twi
     socketRef.current?.emit("audio_end");
+    setWaiting(true); // reply is being prepared → audible loading cue
     setAndSay("Sent. Waiting for a reply…");
   }
 

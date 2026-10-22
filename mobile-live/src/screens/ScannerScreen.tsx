@@ -14,7 +14,7 @@ import { DEMO_UID, SERVER_URL } from "../config";
 import { useLanguage } from "../context/language";
 import { announce, resetAnnouncements } from "../lib/a11y";
 import { base64ToBytes } from "../lib/base64";
-import { EncodedGuidancePlayer, GuidancePlayer } from "../lib/audio";
+import { EncodedGuidancePlayer, GuidancePlayer, PulseCue } from "../lib/audio";
 
 const ARROWS: Record<string, string> = {
   move_up: "⬆️",
@@ -55,6 +55,10 @@ export function ScannerScreen() {
   const [status, setStatus] = useState("Starting camera…");
   const [result, setResult] = useState<ScanResult | null>(null);
   const [speaking, setSpeaking] = useState(false);
+  // True while the socket/session is opening — a silent "loading" window before
+  // the scanner is ready. Per-frame server analysis is signalled separately via
+  // the "processing" result status. Both drive the audible loading cue below.
+  const [connecting, setConnecting] = useState(false);
 
   const cameraRef = useRef<Camera>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -62,6 +66,9 @@ export function ScannerScreen() {
   const busyRef = useRef(false);
   const pcmRef = useRef<GuidancePlayer | null>(null);
   const ttsRef = useRef<EncodedGuidancePlayer | null>(null);
+  // Audible "working…" cue: the scanner analysing a frame is silent and has no
+  // visible spinner a blind user could rely on.
+  const cueRef = useRef<PulseCue | null>(null);
 
   useEffect(() => {
     resetAnnouncements();
@@ -80,9 +87,27 @@ export function ScannerScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasPermission, language]);
 
+  // Create the loading cue once; close it on unmount.
+  useEffect(() => {
+    cueRef.current = new PulseCue();
+    return () => {
+      cueRef.current?.close();
+      cueRef.current = null;
+    };
+  }, []);
+
+  // Sound the "working…" cue while the scanner is opening or analysing a frame,
+  // but never over spoken guidance.
+  const loading = !speaking && (connecting || result?.status === "processing");
+  useEffect(() => {
+    if (loading) cueRef.current?.start();
+    else cueRef.current?.stop();
+  }, [loading]);
+
   function start() {
     stop();
     setResult(null);
+    setConnecting(true);
 
     const pcm = new GuidancePlayer();
     pcm.onPlayingChange = setSpeaking;
@@ -98,6 +123,7 @@ export function ScannerScreen() {
     socketRef.current = socket;
 
     socket.on("connect", () => {
+      setConnecting(false);
       setStatus("Point the camera at a medicine label.");
       announce("Scanner ready. Point the camera at a medicine label.");
     });
@@ -120,10 +146,14 @@ export function ScannerScreen() {
     socket.on("tts_audio", (p: { data?: string }) => p?.data && ttsRef.current?.play(p.data));
     socket.on("error", (e: { message?: string } | string) => {
       const msg = typeof e === "string" ? e : e?.message ?? "error";
+      setConnecting(false);
       setStatus("Error: " + msg);
       announce("Error: " + msg);
     });
-    socket.on("disconnect", (r) => setStatus("Disconnected: " + r));
+    socket.on("disconnect", (r) => {
+      setConnecting(false);
+      setStatus("Disconnected: " + r);
+    });
 
     // Snapshot the preview ~1.5 fps and stream JPEG bytes; the server throttles
     // to its own tick, so an approximate rate is fine.
@@ -160,7 +190,9 @@ export function ScannerScreen() {
     pcmRef.current = null;
     ttsRef.current?.close();
     ttsRef.current = null;
+    cueRef.current?.stop();
     setSpeaking(false);
+    setConnecting(false);
   }
 
   const match = result?.prescription_match;

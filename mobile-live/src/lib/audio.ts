@@ -361,6 +361,121 @@ export class EncodedGuidancePlayer {
   }
 }
 
+// ─────────────────────────────────────────────
+//  PulseCue — a gentle, repeating "working / loading" tone.
+//
+//  For a visually-impaired user a silent spinner is invisible. When the app is
+//  busy but NOT listening or speaking — the assistant connecting to the server,
+//  the scanner analysing a frame — this plays a soft periodic blip so the user
+//  knows work is in progress and the app has not frozen. It is stopped whenever
+//  real speech plays so the two never overlap.
+//
+//  Built on the same four AudioContext calls the other players here use
+//  (createBuffer / createBufferSource / connect / start) — no oscillator or gain
+//  nodes — so it shares their proven-on-device API surface. The soft bell
+//  envelope and low amplitude are baked into the sample buffer.
+// ─────────────────────────────────────────────
+export class PulseCue {
+  private ctx?: AudioContext;
+  private tone?: AudioBuffer;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private lingerTimer: ReturnType<typeof setTimeout> | null = null;
+  private current?: AudioBufferSourceNode;
+
+  // ~150 ms soft blip repeated every 1.3 s — present enough to reassure, sparse
+  // and quiet enough not to feel alarming or fight spoken guidance.
+  private static readonly TONE_MS = 150;
+  private static readonly PERIOD_MS = 1300;
+  private static readonly FREQ_HZ = 396; // calm low-mid pitch
+  private static readonly AMP = 0.16; // gentle
+  // A brief stop() is deferred this long so a loading state that flickers off
+  // and back on (e.g. the scanner's "processing" status between frames) keeps a
+  // steady cadence instead of re-triggering an immediate blip each time.
+  private static readonly LINGER_MS = 600;
+
+  private ensure(): AudioContext {
+    if (!this.ctx) this.ctx = new AudioContext({ sampleRate: OUTPUT_RATE });
+    // Mobile audio sessions often begin suspended; resume so the cue is audible.
+    if (this.ctx.state === "suspended") void this.ctx.resume();
+    return this.ctx;
+  }
+
+  private build(ctx: AudioContext): AudioBuffer {
+    if (this.tone) return this.tone;
+    const n = Math.floor((OUTPUT_RATE * PulseCue.TONE_MS) / 1000);
+    const data = new Float32Array(n);
+    const w = (2 * Math.PI * PulseCue.FREQ_HZ) / OUTPUT_RATE;
+    for (let i = 0; i < n; i++) {
+      // Raised-cosine (Hann) envelope → no clicks at onset/offset.
+      const env = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1));
+      data[i] = Math.sin(w * i) * env * PulseCue.AMP;
+    }
+    const buf = ctx.createBuffer(1, n, OUTPUT_RATE);
+    buf.copyToChannel(data, 0);
+    this.tone = buf;
+    return buf;
+  }
+
+  private blip(): void {
+    const ctx = this.ensure();
+    const node = ctx.createBufferSource();
+    node.buffer = this.build(ctx);
+    node.connect(ctx.destination);
+    this.current = node;
+    node.onended = () => {
+      if (this.current === node) this.current = undefined;
+    };
+    try {
+      node.start();
+    } catch {
+      /* noop */
+    }
+  }
+
+  /** Begin (or keep) the repeating cue. Idempotent. */
+  start(): void {
+    if (this.lingerTimer) {
+      // A stop is pending from a momentary gap — cancel it and keep going
+      // seamlessly, without an extra immediate blip.
+      clearTimeout(this.lingerTimer);
+      this.lingerTimer = null;
+    }
+    if (this.timer) return;
+    this.ensure();
+    this.blip(); // sound immediately rather than after a full period
+    this.timer = setInterval(() => this.blip(), PulseCue.PERIOD_MS);
+  }
+
+  /** Stop the repeating cue after a short linger. Idempotent. */
+  stop(): void {
+    if (!this.timer || this.lingerTimer) return;
+    this.lingerTimer = setTimeout(() => {
+      this.lingerTimer = null;
+      this.hardStop();
+    }, PulseCue.LINGER_MS);
+  }
+
+  private hardStop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    try {
+      this.current?.stop();
+    } catch {
+      /* noop */
+    }
+    this.current = undefined;
+  }
+
+  close(): void {
+    if (this.lingerTimer) clearTimeout(this.lingerTimer);
+    this.lingerTimer = null;
+    this.hardStop();
+    void this.ctx?.close();
+    this.ctx = undefined;
+    this.tone = undefined;
+  }
+}
+
 function concatFloat32(parts: Float32Array[]): Float32Array {
   let len = 0;
   for (const p of parts) len += p.length;
