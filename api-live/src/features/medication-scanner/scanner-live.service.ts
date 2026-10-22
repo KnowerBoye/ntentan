@@ -120,7 +120,24 @@ const INSTRUCTIONS: PositioningInstruction[] = [
   "move_closer", "move_farther", "hold_still", "none",
 ];
 
-const SCANNER_SYSTEM_PROMPT = `
+// When the session language is Twi, the model's spoken guidance may be
+// machine-translated into Twi (the live fallback when a positioning cue has no
+// pre-baked asset). The translator works best on plain English, so we ask the
+// model to keep its one-sentence guidance simple and literal. Most Twi scanner
+// speech is pre-baked or built server-side, so this mainly steadies that
+// fallback; it never changes what the user is told to do.
+const SCANNER_TWI_GUIDANCE = `
+When you SPEAK and when you write guidance_text, use the simplest possible
+English: short, plain words and one clear idea. Avoid idioms, metaphors, and
+unusual words. Your words will be translated into Twi, and simple English
+translates best.
+`;
+
+function buildScannerSystemPrompt(isTwi: boolean): string {
+  return `${SCANNER_SYSTEM_PROMPT_BODY}${isTwi ? SCANNER_TWI_GUIDANCE : ""}`;
+}
+
+const SCANNER_SYSTEM_PROMPT_BODY = `
 You are a medication label reading assistant in a live camera session. You
 receive the most recent camera frame and must guide the user to position a
 medication so its label can be read.
@@ -291,7 +308,7 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
         // the model's spoken guidance to the client — and read the structured
         // assessment from the report_guidance tool call.
         responseModalities: [Modality.AUDIO],
-        systemInstruction: SCANNER_SYSTEM_PROMPT,
+        systemInstruction: buildScannerSystemPrompt(isTwi),
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: LIVE_VOICE_NAME } },
         },

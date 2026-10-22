@@ -124,7 +124,7 @@ export async function handleAssistantLiveConnection(socket: Socket): Promise<voi
       model: LIVE_ASSISTANT_MODEL,
       config: {
         responseModalities: [Modality.AUDIO],
-        systemInstruction: buildLiveSystemPrompt(),
+        systemInstruction: buildLiveSystemPrompt(language),
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: LIVE_VOICE_NAME } },
         },

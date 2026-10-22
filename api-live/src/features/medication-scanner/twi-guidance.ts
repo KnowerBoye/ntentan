@@ -26,18 +26,24 @@ import { logger } from "@/lib/logger";
  * is set it is treated as authoritative (hand-authored) and translation is
  * skipped by the builder; otherwise the builder fills it from GhanaNLP.
  */
+// NOTE: the `twi` values below are hand-authored DRAFTS (standardized on "aduro"
+// for medicine) replacing the machine translations, which had errors: move_down
+// previously meant "remove it from there", flip dropped "over", no_object was a
+// long clause that dropped "label", and the term for medicine varied across
+// cues. They are UNVERIFIED — a Twi speaker should confirm each before running
+// `npm run build:twi-guidance` (which keeps these overrides and only re-synthesizes audio).
 export const CANONICAL_GUIDANCE: Record<string, { english: string; twi?: string }> = {
-  move_up: { english: "Move the medication up." },
-  move_down: { english: "Move the medication down." },
-  move_left: { english: "Move the medication to the left." },
-  move_right: { english: "Move the medication to the right." },
-  rotate_left: { english: "Turn the label to the left." },
-  rotate_right: { english: "Turn the label to the right." },
-  flip: { english: "Turn the medication over." },
-  move_closer: { english: "Bring the medication closer." },
-  move_farther: { english: "Move the medication farther away." },
-  hold_still: { english: "Hold it still." },
-  no_object: { english: "Point the camera at a medication label." },
+  move_up: { english: "Move the medication up.", twi: "Ma aduro no so kɔ soro." },
+  move_down: { english: "Move the medication down.", twi: "Fa aduro no kɔ fam." },
+  move_left: { english: "Move the medication to the left.", twi: "Fa aduro no kɔ benkum so." },
+  move_right: { english: "Move the medication to the right.", twi: "Fa aduro no kɔ nifa so." },
+  rotate_left: { english: "Turn the label to the left.", twi: "Dane nkyerɛwde no kɔ benkum so." },
+  rotate_right: { english: "Turn the label to the right.", twi: "Dane nkyerɛwde no kɔ nifa so." },
+  flip: { english: "Turn the medication over.", twi: "Dane aduro no ani." },
+  move_closer: { english: "Bring the medication closer.", twi: "Fa aduro no bra anim." },
+  move_farther: { english: "Move the medication farther away.", twi: "Fa aduro no kɔ akyiri kakra." },
+  hold_still: { english: "Hold it still.", twi: "Kura mu wɔ hɔ." },
+  no_object: { english: "Point the camera at a medication label.", twi: "Fa aduro no kyerɛ afiri no so." },
 };
 
 export const TWI_GUIDANCE_DIR = path.resolve(process.cwd(), "assets", "twi-guidance");

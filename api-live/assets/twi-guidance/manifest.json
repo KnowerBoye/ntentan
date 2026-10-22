@@ -1,24 +1,24 @@
 {
-  "generatedAt": "2026-10-22T06:42:06.876Z",
+  "generatedAt": "2026-10-22T21:56:26.757Z",
   "phrases": {
     "move_up": {
       "english": "Move the medication up.",
-      "twi": "Ma aduru no nkɔ soro.",
+      "twi": "Ma aduro no so kɔ soro.",
       "audio": "move_up.wav"
     },
     "move_down": {
       "english": "Move the medication down.",
-      "twi": "Yi aduru no fi hɔ.",
+      "twi": "Fa aduro no kɔ fam.",
       "audio": "move_down.wav"
     },
     "move_left": {
       "english": "Move the medication to the left.",
-      "twi": "Fa aduru no kɔ benkum so.",
+      "twi": "Fa aduro no kɔ benkum so.",
       "audio": "move_left.wav"
     },
     "move_right": {
       "english": "Move the medication to the right.",
-      "twi": "Fa aduru no kɔ nifa so.",
+      "twi": "Fa aduro no kɔ nifa so.",
       "audio": "move_right.wav"
     },
     "rotate_left": {
@@ -33,27 +33,27 @@
     },
     "flip": {
       "english": "Turn the medication over.",
-      "twi": "Dane aduro no.",
+      "twi": "Dane aduro no ani.",
       "audio": "flip.wav"
     },
     "move_closer": {
       "english": "Bring the medication closer.",
-      "twi": "Fa aduru no bɛn.",
+      "twi": "Fa aduro no bra anim.",
       "audio": "move_closer.wav"
     },
     "move_farther": {
       "english": "Move the medication farther away.",
-      "twi": "Ma aduru no nkɔ akyirikyiri.",
+      "twi": "Fa aduro no kɔ akyiri kakra.",
       "audio": "move_farther.wav"
     },
     "hold_still": {
       "english": "Hold it still.",
-      "twi": "Kura mu ara.",
+      "twi": "Kura mu wɔ hɔ.",
       "audio": "hold_still.wav"
     },
     "no_object": {
       "english": "Point the camera at a medication label.",
-      "twi": "Kyerɛ mfoninitwa afiri no wɔ nnuru a wɔde sa yare so.",
+      "twi": "Fa aduro no kyerɛ afiri no so.",
       "audio": "no_object.wav"
     }
   }
