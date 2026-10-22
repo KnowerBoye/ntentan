@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { useAuth } from "../../context/AuthContext";
 import { useLog, sizeOf } from "../../context/LogContext";
-import { Recorder, Player } from "../../lib/audio";
+import { Recorder, Player, EncodedPlayer } from "../../lib/audio";
 
 interface Msg {
   id: number;
@@ -21,10 +21,14 @@ export function AssistantPanel({ serverUrl }: { serverUrl: string }) {
   const [status, setStatus] = useState("Not connected.");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [textIn, setTextIn] = useState("");
+  const [language, setLanguage] = useState(
+    () => localStorage.getItem("assistantLang") || "en"
+  );
 
   const socketRef = useRef<Socket | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
   const playerRef = useRef<Player | null>(null);
+  const ttsPlayerRef = useRef<EncodedPlayer | null>(null);
   const idRef = useRef(0);
   const curUser = useRef<number | null>(null);
   const curModel = useRef<number | null>(null);
@@ -51,6 +55,8 @@ export function AssistantPanel({ serverUrl }: { serverUrl: string }) {
     recorderRef.current = null;
     playerRef.current?.close();
     playerRef.current = null;
+    ttsPlayerRef.current?.close();
+    ttsPlayerRef.current = null;
     socketRef.current?.disconnect();
     socketRef.current = null;
     setMicOn(false);
@@ -73,8 +79,13 @@ export function AssistantPanel({ serverUrl }: { serverUrl: string }) {
     player.onPlayingChange = setSpeaking;
     playerRef.current = player;
 
+    // Twi path: GhanaNLP TTS clips arrive as encoded WAV on "tts_audio".
+    const ttsPlayer = new EncodedPlayer();
+    ttsPlayer.onPlayingChange = setSpeaking;
+    ttsPlayerRef.current = ttsPlayer;
+
     const socket = io(serverUrl + "/assistant-live", {
-      auth: { uid },
+      auth: { uid, language },
       transports: ["websocket"],
     });
     socketRef.current = socket;
@@ -93,6 +104,10 @@ export function AssistantPanel({ serverUrl }: { serverUrl: string }) {
     socket.on("audio", (p: { data: string; mimeType?: string }) => {
       playerRef.current?.enqueue(p.data);
       log({ dir: "in", channel: "assistant-live", name: "audio", meta: sizeOf(p.data) });
+    });
+    socket.on("tts_audio", (p: { data: string; mimeType?: string }) => {
+      ttsPlayerRef.current?.play(p.data).catch(() => {});
+      log({ dir: "in", channel: "assistant-live", name: "tts_audio", meta: sizeOf(p.data) });
     });
     socket.on("transcript", (p: { role: "user" | "model"; text: string }) => {
       if (p.role === "user") {
@@ -114,6 +129,7 @@ export function AssistantPanel({ serverUrl }: { serverUrl: string }) {
     });
     socket.on("interrupted", () => {
       playerRef.current?.flush();
+      ttsPlayerRef.current?.flush();
       push("sys", "⎚ interrupted (barge-in)");
       log({ dir: "in", channel: "assistant-live", name: "interrupted" });
     });
@@ -148,6 +164,9 @@ export function AssistantPanel({ serverUrl }: { serverUrl: string }) {
       return;
     }
     try {
+      // Twi has no live barge-in (Gemini never hears the user), so starting a
+      // new utterance stops any reply still playing.
+      ttsPlayerRef.current?.flush();
       const rec = new Recorder();
       await rec.start((b64) => {
         socket.emit("audio", { data: b64 });
@@ -190,6 +209,18 @@ export function AssistantPanel({ serverUrl }: { serverUrl: string }) {
           <button className={micOn ? "live" : ""} onClick={toggleMic} disabled={!ready}>
             {micOn ? "🔴 Listening — tap to stop" : "🎤 Talk"}
           </button>
+          <select
+            value={language}
+            disabled={connected}
+            title={connected ? "Reconnect to change language" : "Assistant language"}
+            onChange={(e) => {
+              setLanguage(e.target.value);
+              localStorage.setItem("assistantLang", e.target.value);
+            }}
+          >
+            <option value="en">English</option>
+            <option value="tw">Twi (Akan)</option>
+          </select>
           <span className="pill">{speaking ? "🔊 speaking" : ready ? "idle" : "—"}</span>
         </div>
         <div className="row">

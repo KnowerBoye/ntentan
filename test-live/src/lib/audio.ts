@@ -153,6 +153,81 @@ export class Player {
 }
 
 /**
+ * Player for encoded audio clips (e.g. GhanaNLP TTS WAV for the Twi assistant).
+ * The server sentence-chunks a reply into several clips, so they must play
+ * gaplessly and IN ORDER: decode+schedule is serialized on a promise chain and
+ * each clip is scheduled at a running time cursor. Decoded via decodeAudioData
+ * (handles WAV/MP3/etc.), so the source sample rate need not match the context.
+ * A generation counter makes in-flight decodes no-op after flush() (barge-in).
+ */
+export class EncodedPlayer {
+  private ctx?: AudioContext;
+  private sources = new Set<AudioBufferSourceNode>();
+  private nextTime = 0;
+  private chain: Promise<void> = Promise.resolve();
+  private gen = 0;
+  onPlayingChange?: (playing: boolean) => void;
+
+  private ensure(): AudioContext {
+    if (!this.ctx) {
+      this.ctx = new AudioContext();
+      this.nextTime = this.ctx.currentTime;
+    }
+    return this.ctx;
+  }
+
+  /** Queue a clip; clips play in call order, back-to-back. */
+  play(b64: string): Promise<void> {
+    this.chain = this.chain.then(() => this.decodeAndSchedule(b64)).catch(() => {});
+    return this.chain;
+  }
+
+  private async decodeAndSchedule(b64: string): Promise<void> {
+    const ctx = this.ensure();
+    if (ctx.state === "suspended") await ctx.resume();
+    const myGen = this.gen;
+    // base64ToBytes allocates a fresh, exactly-sized ArrayBuffer.
+    const bytes = base64ToBytes(b64);
+    const buf = await ctx.decodeAudioData(bytes.buffer as ArrayBuffer);
+    if (myGen !== this.gen) return; // flushed while decoding
+
+    const node = ctx.createBufferSource();
+    node.buffer = buf;
+    node.connect(ctx.destination);
+    const start = Math.max(this.nextTime, ctx.currentTime);
+    node.start(start);
+    this.nextTime = start + buf.duration;
+    this.sources.add(node);
+    this.onPlayingChange?.(true);
+    node.onended = () => {
+      this.sources.delete(node);
+      if (this.sources.size === 0) this.onPlayingChange?.(false);
+    };
+  }
+
+  /** Stop and drop all queued/playing clips (barge-in / new utterance). */
+  flush(): void {
+    this.gen++;
+    this.sources.forEach((n) => {
+      try {
+        n.stop();
+      } catch {
+        /* noop */
+      }
+    });
+    this.sources.clear();
+    if (this.ctx) this.nextTime = this.ctx.currentTime;
+    this.onPlayingChange?.(false);
+  }
+
+  close(): void {
+    this.flush();
+    void this.ctx?.close();
+    this.ctx = undefined;
+  }
+}
+
+/**
  * Player for the scanner's spoken guidance, with "latest-wins, no interrupt"
  * discipline:
  *   - chunks of a cue arrive via pushChunk(); endUtterance() seals the cue.
@@ -226,6 +301,84 @@ export class GuidancePlayer {
     this.current = undefined;
     this.pending = null;
     this.incoming = [];
+    void this.ctx?.close();
+    this.ctx = undefined;
+    this.onPlayingChange?.(false);
+  }
+}
+
+/**
+ * Guidance player for ENCODED clips (GhanaNLP TTS WAV, Twi scanner). Same
+ * "latest-wins, no-interrupt" discipline as GuidancePlayer, but each cue is one
+ * self-contained WAV decoded via decodeAudioData rather than a stream of PCM
+ * chunks: the clip currently playing is never cut off, and clips that arrive
+ * while one plays collapse to a single pending slot holding only the newest.
+ */
+export class EncodedGuidancePlayer {
+  private ctx?: AudioContext;
+  private current?: AudioBufferSourceNode;
+  private pending: string | null = null; // newest base64 clip waiting to play
+  private busy = false; // decoding or playing
+  onPlayingChange?: (playing: boolean) => void;
+
+  private ensure(): AudioContext {
+    if (!this.ctx) this.ctx = new AudioContext();
+    return this.ctx;
+  }
+
+  /** Queue a clip. Plays now if idle, else keeps only the newest as pending. */
+  play(b64: string): void {
+    if (this.busy) {
+      this.pending = b64;
+      return;
+    }
+    void this.start(b64);
+  }
+
+  private async start(b64: string): Promise<void> {
+    this.busy = true;
+    const ctx = this.ensure();
+    if (ctx.state === "suspended") await ctx.resume();
+    let buf: AudioBuffer;
+    try {
+      buf = await ctx.decodeAudioData(base64ToBytes(b64).buffer as ArrayBuffer);
+    } catch {
+      this.busy = false;
+      this.afterEnd();
+      return;
+    }
+    const node = ctx.createBufferSource();
+    node.buffer = buf;
+    node.connect(ctx.destination);
+    this.current = node;
+    this.onPlayingChange?.(true);
+    node.start();
+    node.onended = () => {
+      this.current = undefined;
+      this.busy = false;
+      this.afterEnd();
+    };
+  }
+
+  private afterEnd(): void {
+    if (this.pending) {
+      const next = this.pending;
+      this.pending = null;
+      void this.start(next); // jump straight to the freshest cue
+    } else {
+      this.onPlayingChange?.(false);
+    }
+  }
+
+  close(): void {
+    try {
+      this.current?.stop();
+    } catch {
+      /* noop */
+    }
+    this.current = undefined;
+    this.pending = null;
+    this.busy = false;
     void this.ctx?.close();
     this.ctx = undefined;
     this.onPlayingChange?.(false);

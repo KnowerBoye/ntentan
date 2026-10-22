@@ -152,13 +152,10 @@ export function emitMedScannerResponse(
   response: MedScannerResponse,
 ): boolean {
   // Validate at runtime — catch contract violations immediately
-  console.log(response)
   const parsed = medScannerResponseSchema.parse(response);
 
   // Serialise consistently (the current code has mixed raw/stringified emits)
   const payload = JSON.stringify(parsed);
-
-  console.log(payload)
 
   return socket.emit("response", payload);
 }

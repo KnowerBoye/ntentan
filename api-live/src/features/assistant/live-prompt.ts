@@ -5,7 +5,30 @@
 //  and hard safety rules as the REST assistant's buildSystemPrompt(), but
 //  rewritten for *spoken* conversation: short sentences, no markdown/bullets,
 //  no URLs read aloud, one follow-up question at a time.
+//
+//  The prompt is ENGLISH ONLY. Gemini does not construct good Twi, so the Twi
+//  path never asks it to: Twi is translated to English before the model and
+//  back to Twi after it (see ghananlp.service.ts / assistant-live.service.ts).
+//  The model always reasons and replies in English regardless of UI language.
 // ─────────────────────────────────────────────
+
+/** Languages the live assistant can converse in (UI toggle + validation). */
+export type AssistantLanguage = "en" | "tw";
+
+/** Default when the client sends nothing / an unknown value. */
+export const DEFAULT_LANGUAGE: AssistantLanguage = "en";
+
+export const SUPPORTED_LANGUAGES: Record<AssistantLanguage, { label: string }> = {
+  en: { label: "English" },
+  tw: { label: "Twi (Akan)" },
+};
+
+/** Normalise an arbitrary client value to a supported language. */
+export function normalizeLanguage(value: unknown): AssistantLanguage {
+  return typeof value === "string" && value in SUPPORTED_LANGUAGES
+    ? (value as AssistantLanguage)
+    : DEFAULT_LANGUAGE;
+}
 
 export function buildLiveSystemPrompt(): string {
   return `You are a professional, warm, and empathetic AI medical assistant speaking with a user out loud in a live voice conversation.

@@ -24,6 +24,16 @@ export const LIVE_SCANNER_MODEL =
 /** Prebuilt voice for the assistant's spoken replies. */
 export const LIVE_VOICE_NAME = process.env.LIVE_VOICE_NAME ?? "Aoede";
 
+// ── GhanaNLP (Twi language layer) ──
+// The Twi voice path routes the assistant's spoken output through GhanaNLP's
+// text-to-speech instead of Gemini's native audio, which handles Twi better.
+// Translation / speech-to-text utilities from the same API can be layered in
+// later. Auth is an Ocp-Apim-Subscription-Key (GHNLP_API_KEY).
+export const GHNLP_API_BASE =
+  process.env.GHNLP_API_BASE ?? "https://translation-api.ghananlp.org";
+/** GhanaNLP TTS voice for Twi synthesis ("female" | "male"). */
+export const GHNLP_TTS_VOICE = process.env.GHNLP_TTS_VOICE ?? "female";
+
 // ── Audio formats are fixed by the Live API contract ──
 /** Client mic → server: 16-bit PCM, mono, 16 kHz, little-endian. */
 export const INPUT_AUDIO_MIME = "audio/pcm;rate=16000";

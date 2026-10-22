@@ -1,0 +1,21 @@
+diff --git a/node_modules/react-native/third-party-podspecs/fmt.podspec b/node_modules/react-native/third-party-podspecs/fmt.podspec
+index 121be50..bb241b1 100644
+--- a/node_modules/react-native/third-party-podspecs/fmt.podspec
++++ b/node_modules/react-native/third-party-podspecs/fmt.podspec
+@@ -17,6 +17,16 @@ Pod::Spec.new do |spec|
+     :git => fmt_git_url,
+     :tag => "11.0.2"
+   }
++  # fmt 11.0.2's compile-time format-string checks use `consteval`, which the
++  # Clang shipped with Xcode 16.3+/26 rejects ("call to consteval function ...
++  # is not a constant expression") when it compiles fmt's own src/format.cc.
++  # The detection block in base.h redefines FMT_USE_CONSTEVAL unconditionally,
++  # so a -DFMT_USE_CONSTEVAL=0 build flag would be overwritten by the header.
++  # Instead we rewrite the source: force FMT_USE_CONSTEVAL to 0 right before its
++  # first use, which makes FMT_CONSTEVAL expand to nothing (constexpr fallback).
++  spec.prepare_command = <<-CMD
++    perl -pi -e 'if (!$done && /^#if FMT_USE_CONSTEVAL/) { print "#undef FMT_USE_CONSTEVAL\\n#define FMT_USE_CONSTEVAL 0\\n"; $done=1; }' include/fmt/base.h
++  CMD
+   spec.pod_target_xcconfig = {
+     "CLANG_CXX_LANGUAGE_STANDARD" => rct_cxx_language_standard(),
+   }

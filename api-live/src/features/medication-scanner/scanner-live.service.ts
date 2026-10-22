@@ -44,8 +44,13 @@ import {
   emitMedScannerResponse,
   PositioningInstruction,
   MedScannerStatus,
+  MedScannerPositioningResponse,
+  MedScannerSuccessResponse,
 } from "@/types/medscanner";
 import { extractMedicationFields, findBestMatch } from "@features/medication-scanner/medscanner.match";
+import { prebakedGuidance } from "@features/medication-scanner/twi-guidance";
+import { normalizeLanguage } from "@features/assistant/live-prompt";
+import { englishToTwiPreserving, twiTTS } from "@features/assistant/ghananlp.service";
 import { LIVE_SCANNER_MODEL, LIVE_VOICE_NAME } from "@config/live";
 import { logger } from "@/lib/logger";
 import { emitSocketError } from "@/lib/socket-error-handler";
@@ -58,6 +63,23 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // One guidance turn roughly every second — the Live API recommends ≤1 FPS for
 // video input, and positioning guidance faster than this just churns the UI.
 const SCANNER_TICK_MS = 1000;
+
+// Continuous frame streaming: push each incoming frame to the session's realtime
+// video channel, but no faster than this (Live API recommends ≤1 FPS for video).
+// Streaming frames as they arrive — decoupled from the nudge — keeps a current
+// view permanently buffered so the model isn't assessing a frame it hasn't yet
+// ingested (the root cause of spurious "no_object").
+const VIDEO_SEND_MIN_MS = 900;
+
+// How often to log a rolling performance summary (frames in/out, turn latency).
+const PERF_LOG_MS = 10000;
+
+// Safety net: if a turn never completes (no turnComplete), don't wedge the
+// single-inflight gate forever — force it open after this long.
+const TURN_TIMEOUT_MS = 8000;
+
+// Twi cues cost more per turn, so ease the cadence (decision: ~1.8s).
+const SCANNER_TWI_TICK_MS = 1800;
 
 // After a success, don't re-run the expensive extraction + vector search while
 // the same label keeps sitting in frame (mirrors the original debounce).
@@ -144,16 +166,48 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
     return;
   }
 
-  logger.info("Scanner-live: client connected", { socketId: socket.id, uid });
+  // Output language (handshake auth/query). Twi routes spoken guidance through
+  // GhanaNLP: pre-baked positioning cues served from disk, success guidance via
+  // the live translate+TTS pipeline. Input (video frames) is unaffected.
+  const language = normalizeLanguage(
+    socket.handshake.auth?.language ?? socket.handshake.query?.language
+  );
+  const isTwi = language === "tw";
+
+  logger.info("Scanner-live: client connected", { socketId: socket.id, uid, language });
 
   // Per-connection state.
   let latestFrame: string | null = null; // most recent base64 JPEG (lossy latest-only)
   let awaitingTurn = false; // single-inflight gate
   let lastSuccessAt = 0;
   let tickTimer: NodeJS.Timeout | undefined;
+  let perfTimer: NodeJS.Timeout | undefined;
   // Whether the current turn has emitted any spoken audio — so we send exactly
   // one "speech_end" boundary per spoken cue (and none for silent turns).
   let turnHadAudio = false;
+
+  // ── Frame / performance instrumentation ──
+  // Counters answer "are frames actually reaching the model?" and "how long does
+  // a guidance turn take end-to-end?" — surfaced in a rolling PERF_LOG_MS summary.
+  let framesReceived = 0; // frames arriving from the client
+  let framesSentToModel = 0; // frames forwarded to the Gemini session
+  let lastVideoSentAt = 0; // throttle gate for continuous streaming
+  let turnStartedAt = 0; // nudge timestamp, for turn-latency measurement
+  let gateSince = 0; // when the single-inflight gate last closed (watchdog)
+  let turnsCompleted = 0;
+  let turnLatencyTotalMs = 0; // sum of nudge→first-tool-call latencies
+  let lastStatus = ""; // most recent reported status (for the summary)
+  // Per-turn audio/tool diagnostics — answers "does the model actually SPEAK, or
+  // does the function-call consume the turn?" (the usual cause of silent audio).
+  let audioPartsThisTurn = 0;
+  let toolCalledThisTurn = false;
+
+  // ── Twi output state ──
+  // Drug names seen in success results, protected during en→tw translation.
+  const drugLexicon = new Set<string>();
+  // Last spoken Twi cue key — dedupes repeated cues (don't re-speak "move closer"
+  // every tick) and avoids re-emitting identical audio.
+  let lastSpokenKey = "";
 
   let session: Session;
   try {
@@ -210,10 +264,13 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
 
     // Spoken guidance: forward the model's native-audio chunks to the client.
     // The client decides playback order; the server only streams + delimits.
-    if (content?.modelTurn?.parts) {
+    // For Twi the native audio is discarded — GhanaNLP TTS provides the spoken
+    // cue instead (pre-baked or live), emitted from handleGuidance as tts_audio.
+    if (content?.modelTurn?.parts && !isTwi) {
       for (const part of content.modelTurn.parts) {
         if (part.inlineData?.data && socket.connected) {
           turnHadAudio = true;
+          audioPartsThisTurn += 1;
           socket.emit("audio", {
             data: part.inlineData.data,
             mimeType: part.inlineData.mimeType,
@@ -223,51 +280,68 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
     }
 
     // Model stopped its own speech early — seal whatever we have as a cue.
-    if (content?.interrupted && turnHadAudio && socket.connected) {
+    if (content?.interrupted && turnHadAudio && socket.connected && !isTwi) {
       socket.emit("speech_end");
       turnHadAudio = false;
     }
 
+    // Tool calls: read the structured guidance and acknowledge so the model can
+    // continue the SAME turn — which, for this half-cascade model, is where the
+    // spoken audio is produced (the function-call message itself carries none).
     const calls = message.toolCall?.functionCalls;
-    if (!calls?.length) {
-      // No tool call this message — on turn end, close out the spoken cue and
-      // release the single-inflight gate.
-      if (content?.turnComplete) {
-        if (turnHadAudio && socket.connected) socket.emit("speech_end");
-        turnHadAudio = false;
-        awaitingTurn = false;
+    if (calls?.length) {
+      toolCalledThisTurn = true;
+      if (turnStartedAt) {
+        // Turn latency = nudge sent → model's first guidance call this turn.
+        turnLatencyTotalMs += Date.now() - turnStartedAt;
+        turnsCompleted += 1;
+        turnStartedAt = 0;
       }
-      return;
-    }
+      for (const call of calls) {
+        const args = (call.args ?? {}) as {
+          status?: string;
+          instruction?: string;
+          guidance_text?: string;
+          medication?: { drug_name?: string; raw_label_text?: string[] };
+        };
 
-    for (const call of calls) {
-      const args = (call.args ?? {}) as {
-        status?: string;
-        instruction?: string;
-        guidance_text?: string;
-        medication?: { drug_name?: string; raw_label_text?: string[] };
-      };
+        try {
+          await handleGuidance(args);
+        } catch (err) {
+          logger.warn("Scanner-live: failed to handle guidance", {
+            socketId: socket.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
 
-      try {
-        await handleGuidance(args);
-      } catch (err) {
-        logger.warn("Scanner-live: failed to handle guidance", {
-          socketId: socket.id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-
-      // Acknowledge the tool call so the model can proceed to the next turn.
-      try {
-        session.sendToolResponse({
-          functionResponses: [{ id: call.id, name: call.name, response: { ok: true } }],
-        });
-      } catch {
-        /* session may have closed */
+        // Acknowledge the tool call so the model proceeds (and then speaks).
+        try {
+          session.sendToolResponse({
+            functionResponses: [{ id: call.id, name: call.name, response: { ok: true } }],
+          });
+        } catch {
+          /* session may have closed */
+        }
       }
     }
 
-    awaitingTurn = false;
+    // Release the single-inflight gate ONLY when the whole turn is done — never
+    // on the tool call alone. Releasing early let the next tick fire a fresh
+    // nudge that preempted the model's still-pending spoken audio (why English
+    // guidance was silent). turnComplete can arrive with or without a tool call,
+    // so this is handled once here for every turn.
+    if (content?.turnComplete) {
+      logger.debug("Scanner-live: turn complete", {
+        socketId: socket.id,
+        audioParts: audioPartsThisTurn,
+        toolCalled: toolCalledThisTurn,
+      });
+      audioPartsThisTurn = 0;
+      toolCalledThisTurn = false;
+      if (turnHadAudio && socket.connected) socket.emit("speech_end");
+      turnHadAudio = false;
+      awaitingTurn = false;
+    }
   }
 
   async function handleGuidance(args: {
@@ -279,6 +353,7 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
     const status = args.status as MedScannerStatus | undefined;
     const guidance_text = args.guidance_text ?? "";
     if (!status || !socket.connected) return;
+    lastStatus = status;
 
     if (status === "success") {
       // Debounce the expensive extraction + vector search.
@@ -293,12 +368,17 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
       });
       const match = await findBestMatch(uid!, fields);
 
-      emitMedScannerResponse(socket, {
-        status: "success",
-        instruction: "none",
-        guidance_text,
-        prescription_match: match,
-      });
+      // Protect drug names in the spoken Twi success message.
+      if (isTwi) {
+        drugLexicon.add(drug_name.trim());
+        if (match?.medication?.name) drugLexicon.add(match.medication.name.trim());
+      }
+
+      await emitLocalized(
+        { status: "success", instruction: "none", guidance_text, prescription_match: match },
+        null, // no pre-baked asset — success text varies (live pipeline)
+        true // always speak the result
+      );
       lastSuccessAt = Date.now();
       return;
     }
@@ -308,36 +388,142 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
       const instruction = INSTRUCTIONS.includes(args.instruction as PositioningInstruction)
         ? (args.instruction as PositioningInstruction)
         : "none";
-      emitMedScannerResponse(socket, { status, instruction, guidance_text });
+      // Pre-baked key: positioning cues key on their instruction; no_object has
+      // its own phrase. "none" has no asset → falls back to the live pipeline.
+      const prebakeKey = status === "no_object" ? "no_object" : instruction;
+      await emitLocalized({ status, instruction, guidance_text }, prebakeKey);
     }
   }
 
-  // ── Tick: push the latest frame + nudge the model for one guidance turn ──
+  // Emit a guidance response, localized for Twi. English passes straight
+  // through. For Twi the structured response carries the Twi guidance_text and
+  // the spoken cue is sent separately as a "tts_audio" WAV: served instantly
+  // from a pre-baked asset when available, else translated + synthesized live.
+  async function emitLocalized(
+    resp: MedScannerPositioningResponse | MedScannerSuccessResponse,
+    prebakeKey: string | null,
+    forceSpeak = false
+  ): Promise<void> {
+    if (!isTwi) {
+      emitMedScannerResponse(socket, resp);
+      return;
+    }
+
+    let twiText: string;
+    let wavBase64: string | null;
+    let key: string;
+
+    const prebaked = prebakeKey ? prebakedGuidance(prebakeKey) : null;
+    if (prebaked) {
+      twiText = prebaked.twi;
+      wavBase64 = prebaked.wavBase64;
+      key = "pre:" + prebakeKey;
+    } else {
+      twiText = (await englishToTwiPreserving(resp.guidance_text, [...drugLexicon])).trim();
+      wavBase64 = twiText ? (await twiTTS(twiText)).toString("base64") : null;
+      key = "live:" + resp.guidance_text;
+    }
+
+    if (!socket.connected) return;
+    emitMedScannerResponse(socket, { ...resp, guidance_text: twiText });
+
+    // Speak only when the cue changed, so a held pose doesn't repeat the same
+    // sentence every tick (success always speaks).
+    if (wavBase64 && (forceSpeak || key !== lastSpokenKey)) {
+      socket.emit("tts_audio", { data: wavBase64, mimeType: "audio/wav" });
+      lastSpokenKey = key;
+    }
+  }
+
+  // Forward a frame to the Gemini session's realtime video channel, throttled
+  // so we never exceed the Live API's ~1 FPS guidance for video input.
+  function streamFrame(frame: string): void {
+    if (!socket.connected) return;
+    const now = Date.now();
+    if (now - lastVideoSentAt < VIDEO_SEND_MIN_MS) return;
+    lastVideoSentAt = now;
+    framesSentToModel += 1;
+    session.sendRealtimeInput({ video: { data: frame, mimeType: "image/jpeg" } });
+  }
+
+  // ── Tick: ensure the freshest frame is in, then nudge for one guidance turn ──
+  // Frames already stream continuously as they arrive (see the "frame" handler),
+  // so the model holds a current view; here we top it up with the very latest
+  // frame and ask for an assessment. Sending the frame just before the nudge —
+  // on top of the continuous stream — is what stops the model assessing an empty
+  // buffer and reporting "no_object".
   tickTimer = setInterval(() => {
-    if (!latestFrame || awaitingTurn || !socket.connected) return;
+    if (!socket.connected) return;
+    // Watchdog: a turn that never completes must not wedge the gate forever.
+    if (awaitingTurn && gateSince && Date.now() - gateSince > TURN_TIMEOUT_MS) {
+      logger.warn("Scanner-live: turn timed out — releasing gate", {
+        socketId: socket.id,
+        waitedMs: Date.now() - gateSince,
+      });
+      if (turnHadAudio) socket.emit("speech_end");
+      turnHadAudio = false;
+      audioPartsThisTurn = 0;
+      toolCalledThisTurn = false;
+      awaitingTurn = false;
+    }
+    if (!latestFrame || awaitingTurn) return;
 
     const frame = latestFrame;
-    latestFrame = null;
     awaitingTurn = true;
+    gateSince = Date.now();
     turnHadAudio = false; // fresh turn: no spoken audio seen yet
+    turnStartedAt = Date.now();
 
     emitMedScannerResponse(socket, { status: "processing" });
 
+    // Force the freshest frame through even if the throttle would skip it, so
+    // the nudge always assesses the current pose.
+    lastVideoSentAt = Date.now();
+    framesSentToModel += 1;
     session.sendRealtimeInput({ video: { data: frame, mimeType: "image/jpeg" } });
     session.sendRealtimeInput({ text: NUDGE_TEXT });
-  }, SCANNER_TICK_MS);
+    // Twi spends longer per cue (translate/TTS for success; still worth easing
+    // the cadence so guidance doesn't churn ahead of the spoken output).
+  }, isTwi ? SCANNER_TWI_TICK_MS : SCANNER_TICK_MS);
+
+  // ── Rolling performance summary ──
+  perfTimer = setInterval(() => {
+    if (!socket.connected) return;
+    const avgLatency = turnsCompleted ? Math.round(turnLatencyTotalMs / turnsCompleted) : 0;
+    logger.info("Scanner-live: perf", {
+      socketId: socket.id,
+      framesReceived,
+      framesSentToModel,
+      turnsCompleted,
+      avgTurnLatencyMs: avgLatency,
+      lastStatus,
+      awaitingTurn,
+    });
+  }, PERF_LOG_MS);
 
   // ── Client → session ──
   socket.on("frame", (chunk: { buf: ArrayBuffer | Buffer | Uint8Array }) => {
     if (!chunk?.buf) return;
-    // Keep only the newest frame so each tick reflects the current pose.
+    // Keep only the newest frame so each tick reflects the current pose...
     latestFrame = Buffer.from(chunk.buf as Uint8Array).toString("base64");
+    framesReceived += 1;
+    // ...and stream it to the model continuously (throttled) so a current view
+    // is always buffered, independent of the nudge cadence.
+    streamFrame(latestFrame);
   });
 
   // ── Cleanup ──
   socket.on("disconnect", (reason) => {
-    logger.info("Scanner-live: client disconnected", { socketId: socket.id, reason });
+    logger.info("Scanner-live: client disconnected", {
+      socketId: socket.id,
+      reason,
+      framesReceived,
+      framesSentToModel,
+      turnsCompleted,
+      avgTurnLatencyMs: turnsCompleted ? Math.round(turnLatencyTotalMs / turnsCompleted) : 0,
+    });
     if (tickTimer) clearInterval(tickTimer);
+    if (perfTimer) clearInterval(perfTimer);
     latestFrame = null;
     try {
       session.close();

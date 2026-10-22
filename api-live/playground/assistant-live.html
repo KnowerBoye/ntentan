@@ -10,7 +10,7 @@
   h1 { font-size: 1.25rem; }
   .row { display: flex; gap: .5rem; margin-bottom: .5rem; flex-wrap: wrap; }
   input[type=text] { flex: 1; min-width: 220px; padding: .5rem; font: inherit; }
-  button { padding: .5rem 1rem; font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid #8884; }
+  button, select { padding: .5rem 1rem; font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid #8884; }
   button:disabled { opacity: .5; cursor: default; }
   #mic.live { background: #e3342f; color: #fff; }
   #status { font-size: .85rem; opacity: .8; margin: .5rem 0; }
@@ -27,10 +27,14 @@
   <h1>Ntentan — Live Voice Assistant <span class="sys">(Gemini Live API)</span></h1>
 
   <div class="row">
-    <input id="server" type="text" value="http://localhost:8080" placeholder="Server URL" />
+    <input id="server" type="text" value="https://ntentan-api-live-209385824341.us-west1.run.app" placeholder="Server URL" />
   </div>
   <div class="row">
     <input id="uid" type="text" placeholder="User UID (dev: ALLOW_UID_AUTH)" />
+    <select id="lang" title="Assistant language">
+      <option value="en">English</option>
+      <option value="tw">Twi (Akan)</option>
+    </select>
     <button id="connect">Connect</button>
   </div>
   <div class="row">
@@ -52,6 +56,7 @@ let socket = null;
 let micStream = null, inCtx = null, processor = null, micOn = false;
 let outCtx = null, nextPlayTime = 0, liveSources = [];
 let curUserLine = null, curModelLine = null;
+let turnQueue = [], draining = false, playGen = 0, turnEndResolve = null;
 
 function line(cls, text) {
   const d = document.createElement("div");
@@ -103,6 +108,7 @@ function floatToPCM16(f32) {
 
 async function startMic() {
   if (micOn) return;
+  flushPlayback(); // new user turn: stop any reply still playing (English + Twi)
   micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
   inCtx = new AudioContext();
   const src = inCtx.createMediaStreamSource(micStream);
@@ -133,48 +139,143 @@ function stopMic() {
   setStatus("Connected.");
 }
 
-// ── playback of 24kHz PCM16 ──
+// ── English playback: ONE TURN AT A TIME, text paired with its audio ──
+// The server bundles each model response as a "turn" { text, audio[] }. We queue
+// turns and play them strictly in order: a turn's caption is shown exactly when
+// its audio starts, and the next turn is not shown or played until this turn's
+// audio has fully finished. Within a turn the PCM24k chunks are scheduled
+// back-to-back on a running clock (nextPlayTime) for gapless voice; a master-gain
+// fade keeps barge-in flushes click-free. The output AudioContext is RESUMED on
+// demand — a context created lazily in a socket callback starts suspended.
+const SCHEDULE_LEAD = 0.08; // seconds of lead-in before the first chunk
+let masterGain = null;
 function ensureOut() {
-  if (!outCtx) { outCtx = new AudioContext({ sampleRate: OUTPUT_RATE }); nextPlayTime = outCtx.currentTime; }
+  if (!outCtx) {
+    outCtx = new AudioContext({ sampleRate: OUTPUT_RATE });
+    masterGain = outCtx.createGain();
+    masterGain.connect(outCtx.destination);
+  }
+  if (outCtx.state === "suspended") outCtx.resume();
+  return outCtx;
 }
-function playChunk(b64) {
-  ensureOut();
-  const bytes = b64decode(b64);
-  const pcm = new Int16Array(bytes.buffer);
-  const f32 = new Float32Array(pcm.length);
-  for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 0x8000;
-  const buf = outCtx.createBuffer(1, f32.length, OUTPUT_RATE);
-  buf.copyToChannel(f32, 0);
-  const node = outCtx.createBufferSource();
-  node.buffer = buf; node.connect(outCtx.destination);
-  const start = Math.max(nextPlayTime, outCtx.currentTime);
-  node.start(start);
-  nextPlayTime = start + buf.duration;
-  liveSources.push(node);
-  node.onended = () => { liveSources = liveSources.filter((n) => n !== node); };
+
+// Queue a delivered turn and start draining if idle.
+function enqueueTurn(turn) {
+  turnQueue.push(turn);
+  if (!draining) drainTurns();
 }
+// Play queued turns one at a time: show text, play its audio to completion, next.
+async function drainTurns() {
+  draining = true;
+  while (turnQueue.length) {
+    const myGen = playGen;
+    const turn = turnQueue.shift();
+    if (turn.text) { curModelLine = line("model", turn.text); curModelLine = null; }
+    await playTurnAudio(turn.audio);
+    if (playGen !== myGen) break; // flushed mid-turn (barge-in / new user input)
+  }
+  draining = false;
+}
+// Schedule every chunk of one turn gaplessly; resolve when the last finishes.
+function playTurnAudio(chunks) {
+  return new Promise((resolve) => {
+    turnEndResolve = resolve;
+    if (!chunks || !chunks.length) { settleTurn(); return; }
+    const ctx = ensureOut();
+    let startAt = Math.max(ctx.currentTime + SCHEDULE_LEAD, nextPlayTime);
+    let lastNode = null;
+    for (const b64 of chunks) {
+      const bytes = b64decode(b64);
+      const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+      const f32 = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 0x8000;
+      const buf = ctx.createBuffer(1, f32.length, OUTPUT_RATE);
+      buf.copyToChannel(f32, 0);
+      const node = ctx.createBufferSource();
+      node.buffer = buf; node.connect(masterGain);
+      node.start(startAt);
+      startAt += buf.duration;
+      liveSources.push(node);
+      node.onended = () => { liveSources = liveSources.filter((n) => n !== node); };
+      lastNode = node;
+    }
+    nextPlayTime = startAt;
+    lastNode.onended = () => { liveSources = liveSources.filter((n) => n !== lastNode); settleTurn(); };
+  });
+}
+function settleTurn() {
+  const r = turnEndResolve; turnEndResolve = null;
+  if (r) r();
+}
+// Barge-in / new user input: drop the queue, stop playback, release the drain.
 function flushPlayback() {
-  liveSources.forEach((n) => { try { n.stop(); } catch {} });
+  playGen++;
+  turnQueue = [];
+  if (outCtx && masterGain) {
+    const t = outCtx.currentTime;
+    try {
+      masterGain.gain.cancelScheduledValues(t);
+      masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+      masterGain.gain.linearRampToValueAtTime(0, t + 0.015); // fade out (no click)
+      masterGain.gain.setValueAtTime(1, t + 0.03);           // restore for next turn
+    } catch {}
+  }
+  liveSources.forEach((n) => { try { n.onended = null; n.stop(); } catch {} });
   liveSources = [];
   if (outCtx) nextPlayTime = outCtx.currentTime;
+  settleTurn();
+  flushEncoded();
+}
+
+// ── playback of GhanaNLP TTS (Twi): the server sentence-chunks a reply into
+//    several WAV clips; play them in order, gaplessly, via a running cursor. ──
+let encCtx = null, encSources = [], encNextTime = 0, encChain = Promise.resolve(), encGen = 0;
+function playEncoded(b64) {
+  encChain = encChain.then(() => decodeSchedule(b64)).catch((e) => line("sys", "⚠ tts playback: " + e.message));
+  return encChain;
+}
+async function decodeSchedule(b64) {
+  if (!encCtx) { encCtx = new AudioContext(); encNextTime = encCtx.currentTime; }
+  if (encCtx.state === "suspended") await encCtx.resume();
+  const myGen = encGen;
+  const bytes = b64decode(b64);
+  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const buf = await encCtx.decodeAudioData(ab);
+  if (myGen !== encGen) return; // flushed while decoding
+  const node = encCtx.createBufferSource();
+  node.buffer = buf; node.connect(encCtx.destination);
+  const start = Math.max(encNextTime, encCtx.currentTime);
+  node.start(start);
+  encNextTime = start + buf.duration;
+  encSources.push(node);
+  node.onended = () => { encSources = encSources.filter((n) => n !== node); };
+}
+function flushEncoded() {
+  encGen++;
+  encSources.forEach((n) => { try { n.stop(); } catch {} });
+  encSources = [];
+  if (encCtx) encNextTime = encCtx.currentTime;
 }
 
 // ── connect ──
 $("connect").onclick = () => {
   const url = $("server").value.trim();
   const uid = $("uid").value.trim();
+  const language = $("lang").value;
   if (!uid) { setStatus("Enter a user UID first."); return; }
   if (socket) socket.disconnect();
+  ensureOut(); // create + resume the output context under this user gesture
 
-  socket = io(url + "/assistant-live", { auth: { uid }, transports: ["websocket"] });
+  socket = io(url + "/assistant-live", { auth: { uid, language }, transports: ["websocket"] });
 
-  socket.on("connect", () => { setStatus("Socket connected, opening Gemini session…"); line("sys", "● socket connected"); });
+  socket.on("connect", () => { setStatus("Socket connected, opening Gemini session… (" + $("lang").selectedOptions[0].text + ")"); line("sys", "● socket connected — " + $("lang").selectedOptions[0].text); });
   socket.on("ready", () => {
     setStatus("Connected. Ready to talk.");
     line("sys", "● Gemini Live session ready");
     ["mic", "textIn", "send"].forEach((id) => $(id).disabled = false);
   });
-  socket.on("audio", (p) => playChunk(p.data));
+  socket.on("turn", (p) => enqueueTurn(p));
+  socket.on("tts_audio", (p) => playEncoded(p.data).catch((e) => line("sys", "⚠ tts playback: " + e.message)));
   socket.on("transcript", (p) => {
     if (p.role === "user") {
       if (!curUserLine) curUserLine = line("user", "");

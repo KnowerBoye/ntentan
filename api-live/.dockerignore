@@ -1,1 +1,23 @@
+# Build artifacts & deps (re-created by `npm ci` / `npm run build` inside the image).
+# Excluding node_modules also prevents a host-arch (arm64) tree from clobbering the
+# amd64 one installed in the builder stage when building locally on Apple Silicon.
+node_modules
+dist
+
+# VCS / local tooling
+.git
+.github
+
+# Local env & credentials — must NEVER be baked into the image.
+# Runtime gets firebase creds from the mounted Secret Manager secret and Vertex
+# from the Cloud Run service account (ADC).
+.env
+*.local
+google-cred.json
+firebase-cred.json
+
+# Not part of the Cloud Run server image.
 playground
+functions
+docs
+npm-debug.log*

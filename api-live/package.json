@@ -11,6 +11,7 @@
     "build": "tsc -p ./tsconfig.json",
     "dev": "nodemon",
     "smoke": "ts-node --files -r tsconfig-paths/register scripts/live-smoke.ts",
+    "build:twi-guidance": "ts-node --files -r tsconfig-paths/register scripts/build-twi-guidance.ts",
     "lint": "eslint 'src/**/*.ts'",
     "start": "node -r module-alias/register dist/index.js"
   },

@@ -1,0 +1,59 @@
+{
+  "expo": {
+    "name": "Ntentan Live",
+    "slug": "ntentan-mobile-live",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "ntentanlive",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ntentan.mobilelive",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Ntentan uses the microphone so you can talk to the medication assistant.",
+        "NSCameraUsageDescription": "Ntentan uses the camera to scan your medication labels.",
+        "NSLocationWhenInUseUsageDescription": "Ntentan uses your location to send your position to your emergency contacts when you trigger an alert."
+      }
+    },
+    "android": {
+      "package": "com.ntentan.mobilelive",
+      "permissions": [
+        "RECORD_AUDIO",
+        "CAMERA",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "INTERNET",
+        "android.permission.CAMERA",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "plugins": [
+      "expo-dev-client",
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Ntentan uses the camera to scan your medication labels.",
+          "enableMicrophonePermission": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Ntentan uses your location to send your position to your emergency contacts when you trigger an alert."
+        }
+      ],
+      "expo-asset"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4d3b96ee-be8b-4e18-80d2-e08cbbe77ccd"
+      }
+    },
+    "owner": "knowerboye"
+  }
+}

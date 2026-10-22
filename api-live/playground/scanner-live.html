@@ -10,7 +10,7 @@
   h1 { font-size: 1.2rem; }
   .row { display: flex; gap: .5rem; margin-bottom: .5rem; flex-wrap: wrap; }
   input[type=text] { flex: 1; min-width: 200px; padding: .5rem; font: inherit; }
-  button { padding: .5rem 1rem; font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid #8884; }
+  button, select { padding: .5rem 1rem; font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid #8884; }
   button:disabled { opacity: .5; }
   video { width: 100%; border-radius: 10px; background: #000; }
   #guide { font-size: 1.3rem; font-weight: 600; text-align: center; margin: .75rem 0; min-height: 1.6em; }
@@ -25,6 +25,10 @@
   <div class="row"><input id="server" type="text" value="http://localhost:8080" placeholder="Server URL" /></div>
   <div class="row">
     <input id="uid" type="text" placeholder="User UID (dev: ALLOW_UID_AUTH)" />
+    <select id="lang" title="Guidance language">
+      <option value="en">English</option>
+      <option value="tw">Twi (Akan)</option>
+    </select>
     <button id="start">Start scanning</button>
     <button id="stop" disabled>Stop</button>
   </div>
@@ -46,52 +50,117 @@ let socket = null, stream = null, timer = null;
 const video = $("video"), canvas = document.createElement("canvas"), ctx = canvas.getContext("2d");
 
 // ── spoken-guidance playback (24 kHz PCM16, same format as /assistant-live) ──
-// Latest-wins, no-interrupt: the cue currently playing is allowed to finish;
-// cues sealed while it plays collapse to a single slot holding only the newest,
-// so the freshest guidance plays next and stale cues in between are skipped.
+// STREAMING, low-latency, ONE CUE AT A TIME: chunks of a cue are scheduled
+// back-to-back on a running clock the instant they arrive (so the voice starts
+// almost as soon as the model speaks), but cues never overlap. Turns stream
+// sequentially — chunks of cue N, then "speech_end", then chunks of cue N+1 —
+// so the first chunk of a new cue cuts off whatever is left of the previous
+// one. Freshest-wins: for a live positioning scanner, the newest instruction
+// is the one worth hearing, so we interrupt stale guidance rather than queue
+// it (which is what caused several prompts to play at once). A tiny gain fade
+// on the cut avoids a click.
 const OUTPUT_RATE = 24000;
-let outCtx = null, incoming = [], pendingCue = null, currentNode = null;
+const SCHEDULE_LEAD = 0.08;      // seconds of lead-in before the first chunk
+let outCtx = null, masterGain = null, nextTime = 0, liveNodes = new Set(), newCue = true;
 function b64decode(b64) {
   const bin = atob(b64), u8 = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
   return u8;
 }
 function ensureOut() {
-  if (!outCtx) outCtx = new AudioContext({ sampleRate: OUTPUT_RATE });
+  if (!outCtx) {
+    outCtx = new AudioContext({ sampleRate: OUTPUT_RATE });
+    masterGain = outCtx.createGain();
+    masterGain.connect(outCtx.destination);
+  }
+  if (outCtx.state === "suspended") outCtx.resume();
   return outCtx;
 }
+// Drop every scheduled/playing node, fading out first to avoid a click.
+function stopLive() {
+  if (outCtx && masterGain) {
+    const t = outCtx.currentTime;
+    try {
+      masterGain.gain.cancelScheduledValues(t);
+      masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+      masterGain.gain.linearRampToValueAtTime(0, t + 0.015);
+    } catch {}
+  }
+  liveNodes.forEach((n) => { try { n.onended = null; n.stop(); } catch {} });
+  liveNodes.clear();
+  nextTime = 0;
+}
 function pushChunk(b64) {
+  const ctx = ensureOut();
   const bytes = b64decode(b64);
   const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
   const f32 = new Float32Array(pcm.length);
   for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 0x8000;
-  incoming.push(f32);
+
+  // First chunk of a new cue → cut off any still-playing previous cue, then
+  // restore gain (after the fade) just before the new audio starts.
+  if (newCue) {
+    stopLive();
+    const t = ctx.currentTime;
+    masterGain.gain.setValueAtTime(0, t + 0.02);
+    masterGain.gain.setValueAtTime(1, t + 0.03);
+    newCue = false;
+  }
+
+  const buf = ctx.createBuffer(1, f32.length, OUTPUT_RATE);
+  buf.copyToChannel(f32, 0);
+  const node = ctx.createBufferSource();
+  node.buffer = buf; node.connect(masterGain);
+
+  const now = ctx.currentTime;
+  if (nextTime < now + SCHEDULE_LEAD) nextTime = now + SCHEDULE_LEAD;
+  node.start(nextTime);
+  nextTime += buf.duration;
+
+  liveNodes.add(node);
+  node.onended = () => liveNodes.delete(node);
 }
 function endUtterance() {
-  if (!incoming.length) return;
-  let len = 0; incoming.forEach((p) => (len += p.length));
-  const cue = new Float32Array(len);
-  let off = 0; incoming.forEach((p) => { cue.set(p, off); off += p.length; });
-  incoming = [];
-  if (currentNode) pendingCue = cue;   // don't interrupt; keep only the newest
-  else playCue(cue);
-}
-function playCue(samples) {
-  const ctx = ensureOut();
-  const buf = ctx.createBuffer(1, samples.length, OUTPUT_RATE);
-  buf.copyToChannel(samples, 0);
-  const node = ctx.createBufferSource();
-  node.buffer = buf; node.connect(ctx.destination);
-  currentNode = node;
-  node.start();
-  node.onended = () => {
-    currentNode = null;
-    if (pendingCue) { const next = pendingCue; pendingCue = null; playCue(next); }
-  };
+  // Cue finished arriving; the next chunk begins a fresh cue and will cut off
+  // whatever remains of this one if it is still playing.
+  newCue = true;
 }
 function stopPlayback() {
-  try { currentNode && currentNode.stop(); } catch {}
-  currentNode = null; pendingCue = null; incoming = [];
+  stopLive();
+  newCue = true;
+  stopEncoded();
+}
+
+// ── Twi guidance playback: one encoded WAV per cue (GhanaNLP TTS) ──
+// Same latest-wins, no-interrupt discipline, but each cue is a self-contained
+// WAV decoded via decodeAudioData.
+let encCtx = null, encCurrent = null, encPending = null, encBusy = false;
+function playEncoded(b64) {
+  if (encBusy) { encPending = b64; return; }   // keep only the newest
+  startEncoded(b64);
+}
+async function startEncoded(b64) {
+  encBusy = true;
+  if (!encCtx) encCtx = new AudioContext();
+  if (encCtx.state === "suspended") await encCtx.resume();
+  let buf;
+  try {
+    const bytes = b64decode(b64);
+    const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    buf = await encCtx.decodeAudioData(ab);
+  } catch { encBusy = false; return afterEncoded(); }
+  const node = encCtx.createBufferSource();
+  node.buffer = buf; node.connect(encCtx.destination);
+  encCurrent = node;
+  node.start();
+  node.onended = () => { encCurrent = null; encBusy = false; afterEncoded(); };
+}
+function afterEncoded() {
+  if (encPending) { const next = encPending; encPending = null; startEncoded(next); }
+}
+function stopEncoded() {
+  try { encCurrent && encCurrent.stop(); } catch {}
+  encCurrent = null; encPending = null; encBusy = false;
 }
 
 $("start").onclick = async () => {
@@ -101,11 +170,13 @@ $("start").onclick = async () => {
   stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
   video.srcObject = stream; await video.play();
 
-  socket = io(url + "/scanner-live", { auth: { uid }, transports: ["websocket"] });
-  socket.on("connect", () => { $("status").textContent = "Connected — streaming frames."; });
+  const language = $("lang").value;
+  socket = io(url + "/scanner-live", { auth: { uid, language }, transports: ["websocket"] });
+  socket.on("connect", () => { $("status").textContent = "Connected — streaming frames (" + $("lang").selectedOptions[0].text + ")."; });
   socket.on("response", (json) => render(JSON.parse(json)));
   socket.on("audio", (p) => p?.data && pushChunk(p.data));
   socket.on("speech_end", () => endUtterance());
+  socket.on("tts_audio", (p) => p?.data && playEncoded(p.data));
   socket.on("error", (e) => { $("status").textContent = "Error: " + (e?.message || e); });
   socket.on("disconnect", (r) => { $("status").textContent = "Disconnected: " + r; stopPlayback(); });
 

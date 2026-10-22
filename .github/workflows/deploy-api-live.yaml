@@ -1,0 +1,79 @@
+name: Deploy api-live to Cloud Run
+
+# Mirrors api/.github/workflows/deploy.yaml for the Gemini Live API edition.
+# api-live lives inside this monorepo, so the workflow is path-scoped and also
+# dispatchable by hand.
+
+on:
+  push:
+    branches:
+      - staging
+    paths:
+      - "api-live/**"
+      - ".github/workflows/deploy-api-live.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api-live
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker
+        run: gcloud auth configure-docker us-west1-docker.pkg.dev --quiet
+
+      - name: Build & Push Image
+        env:
+          IMAGE: us-west1-docker.pkg.dev/furwoodd-775d1/ntentan/api-live:${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy to Cloud Run
+        env:
+          IMAGE: us-west1-docker.pkg.dev/furwoodd-775d1/ntentan/api-live:${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          RAW_ENV=$(gcloud secrets versions access latest --secret=ntentan-api-live-env --project=furwoodd-775d1)
+
+          if [ -z "$RAW_ENV" ]; then
+            ENV_VARS="NODE_ENV=PRODUCTION"
+          else
+            ENV_VARS=$(printf "%s" "$RAW_ENV" | grep -vE '^\s*#|^\s*$' | tr '\n' ',' | sed 's/,$//')
+            ENV_VARS=$(printf "%s" "$ENV_VARS" | sed -E 's/(^|,)NODE_ENV=[^,]*(,|$)/\1\2/g' | sed 's/,,/,/g' | sed 's/^,//' | sed 's/,$//')
+            ENV_VARS="${ENV_VARS},NODE_ENV=PRODUCTION"
+          fi
+
+          SERVICE_ACCOUNT="ntentan-temp@furwoodd-775d1.iam.gserviceaccount.com"
+
+          gcloud run deploy ntentan-api-live \
+            --image="$IMAGE" \
+            --region=us-west1 \
+            --platform=managed \
+            --allow-unauthenticated \
+            --update-env-vars="$ENV_VARS" \
+            --service-account="$SERVICE_ACCOUNT" \
+            --update-secrets=/usr/src/ntentan-api/secrets/firebase-cred.json=NTENTAN_FIREBASE_CREDENTIALS:latest \
+            --session-affinity \
+            --min-instances=1 \
+            --no-cpu-throttling \
+            --timeout=3600s
+
+          gcloud run services describe ntentan-api-live --project=furwoodd-775d1 --region=us-west1 --format='value(status.url)'

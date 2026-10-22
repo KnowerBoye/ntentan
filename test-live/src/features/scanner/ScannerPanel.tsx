@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { useAuth } from "../../context/AuthContext";
 import { useLog, sizeOf } from "../../context/LogContext";
-import { GuidancePlayer } from "../../lib/audio";
+import { GuidancePlayer, EncodedGuidancePlayer } from "../../lib/audio";
 
 const ARROWS: Record<string, string> = {
   move_up: "⬆️",
@@ -37,6 +37,9 @@ export function ScannerPanel({ serverUrl }: { serverUrl: string }) {
   const [status, setStatus] = useState("Idle.");
   const [result, setResult] = useState<ScanResult | null>(null);
   const [speaking, setSpeaking] = useState(false);
+  const [language, setLanguage] = useState(
+    () => localStorage.getItem("scannerLang") || "en"
+  );
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -46,6 +49,9 @@ export function ScannerPanel({ serverUrl }: { serverUrl: string }) {
   // Plays the scanner's spoken guidance: lets the current cue finish, then jumps
   // to the latest queued cue (24 kHz PCM16, same format as the assistant).
   const playerRef = useRef<GuidancePlayer | null>(null);
+  // Twi guidance arrives as encoded WAV clips on "tts_audio" (same latest-wins
+  // discipline as the PCM player above).
+  const ttsPlayerRef = useRef<EncodedGuidancePlayer | null>(null);
 
   useEffect(() => () => stop(), []);
 
@@ -73,7 +79,14 @@ export function ScannerPanel({ serverUrl }: { serverUrl: string }) {
     player.onPlayingChange = (p) => setSpeaking(p);
     playerRef.current = player;
 
-    const socket = io(serverUrl + "/scanner-live", { auth: { uid }, transports: ["websocket"] });
+    const ttsPlayer = new EncodedGuidancePlayer();
+    ttsPlayer.onPlayingChange = (p) => setSpeaking(p);
+    ttsPlayerRef.current = ttsPlayer;
+
+    const socket = io(serverUrl + "/scanner-live", {
+      auth: { uid, language },
+      transports: ["websocket"],
+    });
     socketRef.current = socket;
     setStatus("Connecting…");
 
@@ -95,6 +108,11 @@ export function ScannerPanel({ serverUrl }: { serverUrl: string }) {
     socket.on("speech_end", () => {
       playerRef.current?.endUtterance();
       log({ dir: "in", channel: "scanner-live", name: "speech_end" });
+    });
+    socket.on("tts_audio", (p: { data?: string }) => {
+      if (!p?.data) return;
+      ttsPlayerRef.current?.play(p.data);
+      log({ dir: "in", channel: "scanner-live", name: "tts_audio", meta: sizeOf(p.data) });
     });
     socket.on("error", (e: { message?: string } | string) => {
       const msg = typeof e === "string" ? e : e?.message ?? "error";
@@ -137,6 +155,8 @@ export function ScannerPanel({ serverUrl }: { serverUrl: string }) {
     socketRef.current = null;
     playerRef.current?.close();
     playerRef.current = null;
+    ttsPlayerRef.current?.close();
+    ttsPlayerRef.current = null;
     setSpeaking(false);
     setScanning(false);
   }
@@ -159,6 +179,18 @@ export function ScannerPanel({ serverUrl }: { serverUrl: string }) {
               Stop
             </button>
           )}
+          <select
+            value={language}
+            disabled={scanning}
+            title={scanning ? "Stop to change language" : "Guidance language"}
+            onChange={(e) => {
+              setLanguage(e.target.value);
+              localStorage.setItem("scannerLang", e.target.value);
+            }}
+          >
+            <option value="en">English</option>
+            <option value="tw">Twi (Akan)</option>
+          </select>
           <span className="pill">{status}</span>
           {speaking && <span className="pill">🔊 speaking…</span>}
         </div>

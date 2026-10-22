@@ -1,0 +1,21 @@
+diff --git a/node_modules/react-native-audio-api/common/cpp/audioapi/core/Constants.h b/node_modules/react-native-audio-api/common/cpp/audioapi/core/Constants.h
+index 4d82dca..7494862 100644
+--- a/node_modules/react-native-audio-api/common/cpp/audioapi/core/Constants.h
++++ b/node_modules/react-native-audio-api/common/cpp/audioapi/core/Constants.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cmath>
++#include <cstddef>
+ #include <limits>
+ 
+ // https://webaudio.github.io/web-audio-api/
+@@ -8,7 +9,7 @@
+ namespace audioapi {
+ // audio
+ static constexpr int RENDER_QUANTUM_SIZE = 128;
+-static constexpr size_t MAX_FFT_SIZE = 32768;
++static constexpr std::size_t MAX_FFT_SIZE = 32768;
+ 
+ // general
+ static constexpr float MOST_POSITIVE_SINGLE_FLOAT = static_cast<float>(std::numeric_limits<float>::max());
