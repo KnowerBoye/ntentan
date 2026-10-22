@@ -246,6 +246,9 @@ export class GuidancePlayer {
 
   private ensure(): AudioContext {
     if (!this.ctx) this.ctx = new AudioContext({ sampleRate: OUTPUT_RATE });
+    // Browsers may start an AudioContext suspended until a user gesture; without
+    // this the scanner's PCM guidance is scheduled but never heard.
+    if (this.ctx.state === "suspended") void this.ctx.resume();
     return this.ctx;
   }
 

@@ -7,6 +7,9 @@
 `assistant-live.service.ts`, `scanner-live.service.ts`, `socket-auth.middleware.ts`,
 `types/medscanner.ts`, `config/live.ts`, and the two reference clients
 (`playground/*.html`, `test-live/src/lib/audio.ts`).
+**2026-10-22:** scanner spoken-audio fix — if voice guidance is silent/choppy on
+the Pi, read **§4.5** (root cause + the player change the Pi must make) and
+**Appendix B** (Python pseudo-code).
 
 The Pi is a **thin relay + I/O device**. It owns the microphone, the speaker, and
 the camera. All intelligence (Gemini, VAD, tools, translation, TTS) lives on the
@@ -290,6 +293,92 @@ Positioning cues arrive continuously (~1/s). The rule (mirrors `GuidancePlayer` 
 This keeps the spoken guidance calm and in sync with on-screen state instead of
 stuttering every tick.
 
+### 4.5 Scanner spoken-audio — full approach (root cause → server fix → **the player the Pi must implement**)
+
+> **Read this if scanner voice guidance is silent, choppy, or plays bursts of
+> clicks.** This section documents the 2026-10-22 audio fix end-to-end: why it
+> broke, what changed on the server (already deployed — the Pi gets it for free),
+> and **the client-side change the Pi's Python player must make.**
+
+#### 4.5.1 Why one nudge is **two turns** (the mental model)
+
+The scanner is not a request/response API. The server holds a persistent Gemini
+Live session and, ~once per second, "nudges" the model to assess the latest
+camera frame. The model answers each nudge as **two (or more) turns**:
+
+```
+  nudge ──▶  Turn A: the report_guidance TOOL CALL   → server emits  "response" (JSON string)   [NO audio]
+             Turn B: the SPOKEN cue                   → server emits  "audio" × N  then  "speech_end"
+```
+
+So **the structured guidance (`response`) and the spoken guidance (`audio` +
+`speech_end`) arrive in separate turns.** Turn B's audio can lag Turn A by a
+second or more — and for a `success` result (where the server runs label
+extraction + a vector DB match before the model speaks) the spoken turn can lag
+by **several seconds**.
+
+#### 4.5.2 What was broken (symptoms on the Pi)
+
+The model emits two things the Pi must never play:
+
+1. **Empty "stub" audio parts** — when the model has nothing new to say (an
+   unchanged cue) or a turn is cut short, it emits a flood of ~3-byte audio parts
+   (base64 length `4`). These are silence/clicks, not speech.
+2. An **interrupted** spoken turn when the *next* nudge fired while the model was
+   still talking — the old server released its turn-gate too early, so the next
+   nudge preempted the speech, truncating it and spraying more stubs.
+
+Net effect on the client: `audio`/`speech_end` events arrived constantly, but
+most carried empty stubs, and real cues were clipped. Any naive player either
+sat silent or stuttered clicks.
+
+#### 4.5.3 What the server now guarantees (the fix you inherit)
+
+`scanner-live.service.ts` was changed so the Pi now receives a **clean** stream:
+
+- **Stubs are dropped server-side** (`MIN_AUDIO_B64 = 64`): only real speech
+  chunks are forwarded on `audio`, and `speech_end` is sent **only** after a real
+  spoken cue — never for a silent/stub turn.
+- **The turn-gate holds until the spoken turn finishes**, so the next nudge can no
+  longer interrupt speech. A status-aware grace waits for the (late) spoken turn
+  before allowing the next nudge: ~1.8 s for positioning/no_object, **5 s for
+  success** (its speech arrives late).
+
+**Contract the Pi can now rely on:** between two `speech_end` events you receive
+the complete set of `audio` chunks for exactly one real spoken cue, in order, and
+you will not receive `speech_end` for silence.
+
+#### 4.5.4 The client-side fix — **what the Pi player must do**
+
+The browser reference client (`test-live/src/lib/audio.ts`) needed one more fix
+that the Pi must mirror in its own way:
+
+> **Browser fix:** `GuidancePlayer` created its `AudioContext` lazily on the first
+> chunk but **never called `ctx.resume()`**, so a context that started *suspended*
+> (browser autoplay policy) stayed silent — audio was scheduled but never heard.
+> The fix was to `resume()` the context in `ensure()`.
+>
+> **Pi equivalent:** there is no autoplay policy, but the same class of bug
+> exists — **open and `.start()` the speaker output stream once at startup, before
+> the first cue arrives.** Do **not** lazily open the output device on the first
+> `audio` chunk; the open latency can swallow the start of the first cue. Keep one
+> persistent 24 kHz / mono / int16 output stream for the whole session.
+
+On top of that, the Pi must implement the **latest-wins, never-interrupt**
+discipline from §4.4 and a **defensive stub drop** (belt-and-suspenders in case it
+ever talks to an older server). Pseudo-code is in **Appendix B**.
+
+#### 4.5.5 Summary of the rules the player encodes
+
+| Rule | Why |
+|------|-----|
+| Accumulate `audio` chunks; **seal on `speech_end`** into one cue | audio and its boundary are separate events |
+| A playing cue is **never interrupted** — let it finish | guidance should sound calm, not stutter |
+| Cues sealed while one plays collapse to **one pending slot (newest wins)** | a live scanner only cares about the *freshest* instruction |
+| **Drop** any `audio` chunk with base64 length `< 64` | defensive: never play silence/clicks (stubs) |
+| **Pre-open** the 24 kHz int16 mono output stream at startup | don't lose the first cue to device-open latency (the Pi's `resume()` equivalent) |
+| On `stop`/`disconnect`/mode-switch, **flush** pending + incoming | don't play stale guidance after the user moves on |
+
 ---
 
 ## 5. Button behavior & client state machine
@@ -469,3 +558,114 @@ good fit for Postman's HTTP tooling, which is why this plan is a written contrac
   ← response "<JSON string>"   ← audio {data b64 PCM24}   ← speech_end
   ← tts_audio {data b64 WAV}   (Twi)   ← error {status,code,message}
 ```
+
+---
+
+### Appendix B — scanner spoken-audio player (Python pseudo-code)
+
+Implements §4.4 + §4.5 for the Pi: one **pre-opened** 24 kHz/int16/mono output
+stream (the `resume()` equivalent), **defensive stub drop**, and **latest-wins,
+never-interrupt** cue playback. Pseudo-code — adapt to your audio stack
+(`sounddevice`, `pyaudio`, or ALSA). The key *behaviours* are what matter, not the
+exact library calls.
+
+```python
+import base64, json, threading
+import numpy as np
+import sounddevice as sd            # or pyaudio / alsaaudio
+
+OUTPUT_RATE   = 24000               # server → Pi English voice: PCM16 mono 24kHz LE
+MIN_AUDIO_B64 = 64                  # drop empty "stub" parts (server already filters)
+
+class ScannerGuidancePlayer:
+    """Latest-wins, never-interrupt playback of the scanner's English PCM cues.
+
+    - push_chunk(b64): append one base64 PCM16@24k chunk to the cue being received.
+    - end_utterance(): called on `speech_end` — seal the cue; play now if idle,
+      else keep ONLY as the newest pending cue (older pending is discarded).
+    - a cue that is already playing is never cut off; when it ends, the freshest
+      pending cue (if any) plays next and anything stale in between is skipped.
+    """
+    def __init__(self):
+        self._incoming = []          # chunks (np.int16) of the cue currently arriving
+        self._pending  = None        # newest sealed cue waiting to play (overwritten)
+        self._playing  = False
+        self._lock     = threading.Lock()
+        # ── The Pi's AudioContext.resume() equivalent ──
+        # Open and START the output device ONCE, up front — NOT lazily on the first
+        # chunk, or the device-open latency swallows the start of the first cue.
+        self._stream = sd.RawOutputStream(
+            samplerate=OUTPUT_RATE, channels=1, dtype="int16")
+        self._stream.start()
+
+    def push_chunk(self, b64: str) -> None:
+        if not b64 or len(b64) < MIN_AUDIO_B64:     # defensive: never play a stub
+            return
+        pcm = np.frombuffer(base64.b64decode(b64), dtype="<i2")
+        with self._lock:
+            self._incoming.append(pcm)
+
+    def end_utterance(self) -> None:                # ← on "speech_end"
+        with self._lock:
+            if not self._incoming:
+                return
+            cue = np.concatenate(self._incoming)
+            self._incoming = []
+            if self._playing:
+                self._pending = cue                 # don't interrupt; keep newest only
+            else:
+                self._start_locked(cue)
+
+    def _start_locked(self, cue) -> None:
+        self._playing = True
+        threading.Thread(target=self._play, args=(cue,), daemon=True).start()
+
+    def _play(self, cue) -> None:
+        self._stream.write(cue.tobytes())           # blocks until this cue finishes
+        with self._lock:
+            nxt, self._pending = self._pending, None
+            if nxt is not None:
+                self._start_locked(nxt)             # jump straight to the freshest cue
+            else:
+                self._playing = False
+
+    def flush(self) -> None:                        # on stop / disconnect / mode-switch
+        with self._lock:
+            self._incoming = []
+            self._pending  = None
+        # (optional) self._stream.abort() to cut the current cue immediately
+
+    def close(self) -> None:
+        self.flush()
+        self._stream.stop(); self._stream.close()
+```
+
+Wiring into the Socket.IO handlers (note `response` is a **JSON string**, and the
+Twi voice uses a *separate* WAV player with the **same** latest-wins rule):
+
+```python
+player     = ScannerGuidancePlayer()     # English PCM cues
+twi_player = EncodedGuidancePlayer()     # Twi: one WAV per cue, same latest-wins rule
+
+@sio.on("audio", namespace="/scanner-live")
+def _on_audio(p):      player.push_chunk(p.get("data"))     # English cue chunk
+
+@sio.on("speech_end", namespace="/scanner-live")
+def _on_speech_end():  player.end_utterance()               # seal + play the cue
+
+@sio.on("tts_audio", namespace="/scanner-live")
+def _on_tts(p):        twi_player.play(p.get("data"))       # Twi WAV cue (en path ignores)
+
+@sio.on("response", namespace="/scanner-live")
+def _on_response(raw):                                      # raw is a STRING
+    r = json.loads(raw)
+    render(r)            # switch on r["status"]: processing | no_object | positioning | success
+
+@sio.on("disconnect", namespace="/scanner-live")
+def _on_disconnect():  player.flush(); twi_player.flush()
+```
+
+`EncodedGuidancePlayer` (Twi) is the same state machine with one difference: each
+`tts_audio` is a **complete WAV clip**, so there is no `push_chunk`/`speech_end`
+pair — `play(b64)` *is* the "seal" step. Decode the WAV (any decoder), then apply
+the identical "play now if idle, else keep newest pending, never interrupt" logic.

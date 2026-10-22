@@ -75,8 +75,34 @@ const VIDEO_SEND_MIN_MS = 900;
 const PERF_LOG_MS = 10000;
 
 // Safety net: if a turn never completes (no turnComplete), don't wedge the
-// single-inflight gate forever — force it open after this long.
-const TURN_TIMEOUT_MS = 8000;
+// single-inflight gate forever — force it open after this long. Kept safely
+// above the success speech grace + a long spoken result so it only ever fires on
+// a genuinely stuck turn, never mid-sentence.
+const TURN_TIMEOUT_MS = 12000;
+
+// Audio parts below this base64 length are empty "stubs" the model emits when a
+// turn is interrupted or a cue is a silent repeat — NOT real speech (real speech
+// chunks are multiple KB). Forwarding them created silent cues + spurious
+// speech_end boundaries on the client that drowned out the real guidance, so we
+// drop anything under this threshold.
+const MIN_AUDIO_B64 = 64;
+
+// The model answers one nudge as (at least) two turns: a tool-call turn (no
+// audio) then a spoken turn. We must not release the single-inflight gate — and
+// let the next nudge fire — until the spoken turn has finished, or the next nudge
+// interrupts the model mid-sentence (the root cause of the scanner's missing
+// audio). Once we send the tool response we arm this grace: if no real speech
+// starts within it, the cycle was silent (an unchanged, already-spoken cue) and
+// we release. Sized to cover the model's post-tool-response speech latency; real
+// speech cancels it immediately.
+//
+// Positioning / no_object cues are short and want a snappy cadence. SUCCESS cues
+// arrive much later (the model takes several seconds to vocalise the result,
+// especially on a slow session) and matter most — and the scan is essentially
+// done at that point — so they get a far longer window. Measured empirically:
+// a 1.5s grace clipped ~half of success cues; a 6s grace caught them all.
+const POST_TOOL_SPEECH_GRACE_MS = Number(process.env.SCANNER_SPEECH_GRACE_MS) || 1800;
+const SUCCESS_SPEECH_GRACE_MS = Number(process.env.SCANNER_SUCCESS_GRACE_MS) || 5000;
 
 // Twi cues cost more per turn, so ease the cadence (decision: ~1.8s).
 const SCANNER_TWI_TICK_MS = 1800;
@@ -182,9 +208,34 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
   let lastSuccessAt = 0;
   let tickTimer: NodeJS.Timeout | undefined;
   let perfTimer: NodeJS.Timeout | undefined;
-  // Whether the current turn has emitted any spoken audio — so we send exactly
-  // one "speech_end" boundary per spoken cue (and none for silent turns).
+  // Whether the current CYCLE (one nudge) has emitted any REAL spoken audio — so
+  // we send exactly one "speech_end" boundary per spoken cue (and none for silent
+  // cycles), and know the spoken turn actually happened before releasing the gate.
   let turnHadAudio = false;
+  // Whether this turn emitted only empty audio "stubs" — the model's signal that
+  // it chose NOT to re-speak an unchanged cue. Lets a held pose release promptly
+  // instead of waiting out the full post-tool grace. Reset per turn.
+  let sawStubThisTurn = false;
+  // Whether a report_guidance tool call has been seen anywhere in this cycle. If
+  // so, a no-audio turnComplete must NOT release the gate — the spoken turn is
+  // still coming (and may be delayed by the success path's extract+match). Reset
+  // per cycle (tick). Distinct from the per-turn toolCalledThisTurn diagnostic.
+  let toolCalledThisCycle = false;
+  // Grace timer (armed when we send the tool response) that releases the gate if
+  // no real speech follows. See the turnComplete handler.
+  let graceTimer: NodeJS.Timeout | undefined;
+  const clearGrace = (): void => {
+    if (graceTimer) {
+      clearTimeout(graceTimer);
+      graceTimer = undefined;
+    }
+  };
+  // Release the single-inflight gate and reset per-cycle speech state.
+  const releaseGate = (): void => {
+    clearGrace();
+    turnHadAudio = false;
+    awaitingTurn = false;
+  };
 
   // ── Frame / performance instrumentation ──
   // Counters answer "are frames actually reaching the model?" and "how long does
@@ -268,14 +319,25 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
     // cue instead (pre-baked or live), emitted from handleGuidance as tts_audio.
     if (content?.modelTurn?.parts && !isTwi) {
       for (const part of content.modelTurn.parts) {
-        if (part.inlineData?.data && socket.connected) {
-          turnHadAudio = true;
-          audioPartsThisTurn += 1;
-          socket.emit("audio", {
-            data: part.inlineData.data,
-            mimeType: part.inlineData.mimeType,
-          });
+        if (!part.inlineData?.data) continue;
+        // Empty stubs (interruption / silent-repeat artefacts) are NOT real
+        // speech — only real speech chunks cross the threshold. Track that the
+        // model emitted stubs (it chose not to re-speak) but don't forward them:
+        // they produced silent cues + spurious speech_end on the client.
+        if (part.inlineData.data.length < MIN_AUDIO_B64) {
+          sawStubThisTurn = true;
+          continue;
         }
+        if (!socket.connected) continue;
+        // Real speech is starting/continuing: we're committed to waiting for this
+        // spoken turn to finish, so cancel the pending silent-release grace.
+        clearGrace();
+        turnHadAudio = true;
+        audioPartsThisTurn += 1;
+        socket.emit("audio", {
+          data: part.inlineData.data,
+          mimeType: part.inlineData.mimeType,
+        });
       }
     }
 
@@ -291,6 +353,7 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
     const calls = message.toolCall?.functionCalls;
     if (calls?.length) {
       toolCalledThisTurn = true;
+      toolCalledThisCycle = true;
       if (turnStartedAt) {
         // Turn latency = nudge sent → model's first guidance call this turn.
         turnLatencyTotalMs += Date.now() - turnStartedAt;
@@ -322,25 +385,58 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
         } catch {
           /* session may have closed */
         }
+
+        // The spoken turn (if any) follows the tool response. Arm the grace now,
+        // measured from THIS point so a slow success (extract + vector match above)
+        // doesn't eat the speech window. Real speech cancels it; if it fires, the
+        // model stayed silent and we release the gate for the next nudge. Only
+        // English forwards native audio — Twi discards it (GhanaNLP TTS instead),
+        // so Twi releases on turnComplete and needs no speech-protection grace.
+        if (!isTwi) {
+          const graceMs =
+            args.status === "success" ? SUCCESS_SPEECH_GRACE_MS : POST_TOOL_SPEECH_GRACE_MS;
+          clearGrace();
+          graceTimer = setTimeout(() => {
+            graceTimer = undefined;
+            if (!turnHadAudio) releaseGate();
+          }, graceMs);
+        }
       }
     }
 
-    // Release the single-inflight gate ONLY when the whole turn is done — never
-    // on the tool call alone. Releasing early let the next tick fire a fresh
-    // nudge that preempted the model's still-pending spoken audio (why English
-    // guidance was silent). turnComplete can arrive with or without a tool call,
-    // so this is handled once here for every turn.
+    // Gate release, because the model splits one nudge into (at least) two turns:
+    // a tool-call turn (no audio) then a spoken turn. Releasing the gate on the
+    // tool-call turn let the next tick fire a nudge that preempted the spoken
+    // turn's still-pending audio — the root cause of the missing/clipped voice.
+    //   • real audio this cycle → the spoken cue finished: seal it with
+    //     speech_end and release.
+    //   • else the model emitted only stubs → it chose not to re-speak an
+    //     unchanged cue: release promptly (no speech to protect).
+    //   • else no tool call this cycle → genuinely empty turn: release.
+    //   • else (tool call in flight, speech may still come) → HOLD; the grace
+    //     armed on sendToolResponse (or the watchdog) will release if it doesn't.
     if (content?.turnComplete) {
       logger.debug("Scanner-live: turn complete", {
         socketId: socket.id,
         audioParts: audioPartsThisTurn,
         toolCalled: toolCalledThisTurn,
+        sawStub: sawStubThisTurn,
       });
+      const hadStub = sawStubThisTurn;
       audioPartsThisTurn = 0;
       toolCalledThisTurn = false;
-      if (turnHadAudio && socket.connected) socket.emit("speech_end");
-      turnHadAudio = false;
-      awaitingTurn = false;
+      sawStubThisTurn = false;
+      if (isTwi) {
+        // Twi forwards no native audio, so there's no spoken turn to protect:
+        // release on every turnComplete (TTS cues are delivered out-of-band).
+        releaseGate();
+      } else if (turnHadAudio) {
+        if (socket.connected) socket.emit("speech_end");
+        releaseGate();
+      } else if (hadStub || !toolCalledThisCycle) {
+        releaseGate();
+      }
+      // else: hold for the spoken turn (grace/watchdog backstops the release).
     }
   }
 
@@ -461,17 +557,20 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
         waitedMs: Date.now() - gateSince,
       });
       if (turnHadAudio) socket.emit("speech_end");
-      turnHadAudio = false;
       audioPartsThisTurn = 0;
       toolCalledThisTurn = false;
-      awaitingTurn = false;
+      sawStubThisTurn = false;
+      releaseGate();
     }
     if (!latestFrame || awaitingTurn) return;
 
     const frame = latestFrame;
     awaitingTurn = true;
     gateSince = Date.now();
-    turnHadAudio = false; // fresh turn: no spoken audio seen yet
+    clearGrace(); // fresh cycle: cancel any stale silent-release
+    turnHadAudio = false; // fresh cycle: no spoken audio seen yet
+    sawStubThisTurn = false;
+    toolCalledThisCycle = false; // fresh cycle: no tool call yet
     turnStartedAt = Date.now();
 
     emitMedScannerResponse(socket, { status: "processing" });
@@ -524,6 +623,7 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
     });
     if (tickTimer) clearInterval(tickTimer);
     if (perfTimer) clearInterval(perfTimer);
+    clearGrace();
     latestFrame = null;
     try {
       session.close();
