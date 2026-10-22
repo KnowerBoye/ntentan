@@ -17,13 +17,9 @@
 //      "audio_end"             mic turned off                 → end audio stream
 //    server → client:
 //      "ready"                 Live session established
-//      "turn"       { text, audio }      ONE English model response: its transcript
-//                                        plus the ordered base64 PCM-24kHz chunks of
-//                                        its spoken audio, bundled at turn end so the
-//                                        client shows the text paired with its audio
-//                                        and finishes each turn before the next.
-//      "tts_audio"  { data, mimeType }   Twi utterance sentence (base64 WAV) — see below
-//      "transcript" { role, text }       user input captions (both langs); Twi model captions
+//      "audio"      { data, mimeType }   model voice chunk (base64 PCM 24kHz)
+//      "tts_audio"  { data, mimeType }   full Twi utterance (base64 WAV) — see below
+//      "transcript" { role, text }       input/output transcription
 //      "tool"       { name }             a tool call is running (UI status)
 //      "sources"    { sources }          citation URLs backing a drug answer
 //      "interrupted"                     barge-in — client should flush playback
@@ -105,13 +101,6 @@ export async function handleAssistantLiveConnection(socket: Socket): Promise<voi
 
   // Sources accumulate across a turn; flushed on turn_complete.
   let turnSources: string[] = [];
-
-  // ── English per-turn bundling (only used when !isTwi) ──
-  // A model turn's spoken audio chunks and its transcript are buffered here and
-  // emitted together as ONE "turn" event at turn end, so the client can show the
-  // text paired with its audio and finish playing each turn before the next.
-  let turnAudio: string[] = []; // ordered base64 PCM24k chunks for the current turn
-  let turnText = ""; // accumulated output transcription for the current turn
 
   // ── Twi pipeline state (only used when isTwi) ──
   // Buffered mic PCM16 for the current utterance (fed to GhanaNLP ASR on
@@ -225,13 +214,18 @@ export async function handleAssistantLiveConnection(socket: Socket): Promise<voi
       const content = message.serverContent;
       if (!content) return;
 
-      // 2. Model audio parts. English: buffer the chunks for this turn — they
-      //    are emitted as one bundled "turn" at turn end, not streamed live.
+      // 2. Model audio parts. English: stream each native-audio chunk straight
+      //    to the client as it arrives (Gemini Live handles the realtime audio).
       //    Twi: the native audio is discarded — GhanaNLP TTS provides the spoken
       //    reply instead (synthesized on turn end).
       if (content.modelTurn?.parts && !isTwi) {
         for (const part of content.modelTurn.parts) {
-          if (part.inlineData?.data) turnAudio.push(part.inlineData.data);
+          if (part.inlineData?.data && socket.connected) {
+            socket.emit("audio", {
+              data: part.inlineData.data,
+              mimeType: part.inlineData.mimeType,
+            });
+          }
         }
       }
 
@@ -249,21 +243,16 @@ export async function handleAssistantLiveConnection(socket: Socket): Promise<voi
           // translate + TTS. The incomplete tail waits for more text.
           englishPending += content.outputTranscription.text;
           peelTwiSentences();
-        } else {
-          // English: accumulate — emitted with its audio in the "turn" bundle.
-          turnText += content.outputTranscription.text;
+        } else if (socket.connected) {
+          socket.emit("transcript", { role: "model", text: content.outputTranscription.text });
         }
       }
 
-      // 4. Barge-in. Drop the half-formed turn so it isn't delivered late:
-      //    the rest of a Twi turn's sentences, or the English turn's buffers.
+      // 4. Barge-in. Drop the rest of a half-formed Twi turn so it isn't spoken late.
       if (content.interrupted) {
         if (isTwi) {
           twiCancelled = true;
           englishPending = "";
-        } else {
-          turnAudio = [];
-          turnText = "";
         }
         if (socket.connected) socket.emit("interrupted");
       }
@@ -280,15 +269,6 @@ export async function handleAssistantLiveConnection(socket: Socket): Promise<voi
           englishPending = "";
           if (rest) enqueueTwiSentence(rest);
           await ttsChain; // keep turn_complete after the last tts_audio
-        } else {
-          // English: deliver the whole turn — text + its audio chunks — as one
-          // unit so the client plays it fully before showing the next turn.
-          const text = turnText.trim();
-          if ((text || turnAudio.length) && socket.connected) {
-            socket.emit("turn", { text, audio: turnAudio });
-          }
-          turnText = "";
-          turnAudio = [];
         }
         if (socket.connected) socket.emit("turn_complete");
       }

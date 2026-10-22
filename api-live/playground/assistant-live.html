@@ -56,7 +56,6 @@ let socket = null;
 let micStream = null, inCtx = null, processor = null, micOn = false;
 let outCtx = null, nextPlayTime = 0, liveSources = [];
 let curUserLine = null, curModelLine = null;
-let turnQueue = [], draining = false, playGen = 0, turnEndResolve = null;
 
 function line(cls, text) {
   const d = document.createElement("div");
@@ -139,14 +138,12 @@ function stopMic() {
   setStatus("Connected.");
 }
 
-// ── English playback: ONE TURN AT A TIME, text paired with its audio ──
-// The server bundles each model response as a "turn" { text, audio[] }. We queue
-// turns and play them strictly in order: a turn's caption is shown exactly when
-// its audio starts, and the next turn is not shown or played until this turn's
-// audio has fully finished. Within a turn the PCM24k chunks are scheduled
-// back-to-back on a running clock (nextPlayTime) for gapless voice; a master-gain
-// fade keeps barge-in flushes click-free. The output AudioContext is RESUMED on
-// demand — a context created lazily in a socket callback starts suspended.
+// ── English playback: DIRECT STREAMING of Gemini Live's 24kHz PCM16 voice ──
+// Each native-audio chunk is scheduled the instant it arrives, back-to-back on a
+// running clock (nextPlayTime) for gapless voice. A master-gain fade makes
+// barge-in flushes click-free. The output AudioContext is RESUMED on demand — a
+// context created lazily in a socket callback starts suspended and would
+// otherwise stay silent (the original "English audio doesn't work" bug).
 const SCHEDULE_LEAD = 0.08; // seconds of lead-in before the first chunk
 let masterGain = null;
 function ensureOut() {
@@ -158,72 +155,37 @@ function ensureOut() {
   if (outCtx.state === "suspended") outCtx.resume();
   return outCtx;
 }
-
-// Queue a delivered turn and start draining if idle.
-function enqueueTurn(turn) {
-  turnQueue.push(turn);
-  if (!draining) drainTurns();
+function playChunk(b64) {
+  const ctx = ensureOut();
+  const bytes = b64decode(b64);
+  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  const f32 = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 0x8000;
+  const buf = ctx.createBuffer(1, f32.length, OUTPUT_RATE);
+  buf.copyToChannel(f32, 0);
+  const node = ctx.createBufferSource();
+  node.buffer = buf; node.connect(masterGain);
+  const now = ctx.currentTime;
+  if (nextPlayTime < now + SCHEDULE_LEAD) nextPlayTime = now + SCHEDULE_LEAD;
+  node.start(nextPlayTime);
+  nextPlayTime += buf.duration;
+  liveSources.push(node);
+  node.onended = () => { liveSources = liveSources.filter((n) => n !== node); };
 }
-// Play queued turns one at a time: show text, play its audio to completion, next.
-async function drainTurns() {
-  draining = true;
-  while (turnQueue.length) {
-    const myGen = playGen;
-    const turn = turnQueue.shift();
-    if (turn.text) { curModelLine = line("model", turn.text); curModelLine = null; }
-    await playTurnAudio(turn.audio);
-    if (playGen !== myGen) break; // flushed mid-turn (barge-in / new user input)
-  }
-  draining = false;
-}
-// Schedule every chunk of one turn gaplessly; resolve when the last finishes.
-function playTurnAudio(chunks) {
-  return new Promise((resolve) => {
-    turnEndResolve = resolve;
-    if (!chunks || !chunks.length) { settleTurn(); return; }
-    const ctx = ensureOut();
-    let startAt = Math.max(ctx.currentTime + SCHEDULE_LEAD, nextPlayTime);
-    let lastNode = null;
-    for (const b64 of chunks) {
-      const bytes = b64decode(b64);
-      const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
-      const f32 = new Float32Array(pcm.length);
-      for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 0x8000;
-      const buf = ctx.createBuffer(1, f32.length, OUTPUT_RATE);
-      buf.copyToChannel(f32, 0);
-      const node = ctx.createBufferSource();
-      node.buffer = buf; node.connect(masterGain);
-      node.start(startAt);
-      startAt += buf.duration;
-      liveSources.push(node);
-      node.onended = () => { liveSources = liveSources.filter((n) => n !== node); };
-      lastNode = node;
-    }
-    nextPlayTime = startAt;
-    lastNode.onended = () => { liveSources = liveSources.filter((n) => n !== lastNode); settleTurn(); };
-  });
-}
-function settleTurn() {
-  const r = turnEndResolve; turnEndResolve = null;
-  if (r) r();
-}
-// Barge-in / new user input: drop the queue, stop playback, release the drain.
+// Barge-in / new user input: stop everything still scheduled, click-free.
 function flushPlayback() {
-  playGen++;
-  turnQueue = [];
   if (outCtx && masterGain) {
     const t = outCtx.currentTime;
     try {
       masterGain.gain.cancelScheduledValues(t);
       masterGain.gain.setValueAtTime(masterGain.gain.value, t);
       masterGain.gain.linearRampToValueAtTime(0, t + 0.015); // fade out (no click)
-      masterGain.gain.setValueAtTime(1, t + 0.03);           // restore for next turn
+      masterGain.gain.setValueAtTime(1, t + 0.03);           // restore for next chunk
     } catch {}
   }
   liveSources.forEach((n) => { try { n.onended = null; n.stop(); } catch {} });
   liveSources = [];
   if (outCtx) nextPlayTime = outCtx.currentTime;
-  settleTurn();
   flushEncoded();
 }
 
@@ -274,7 +236,7 @@ $("connect").onclick = () => {
     line("sys", "● Gemini Live session ready");
     ["mic", "textIn", "send"].forEach((id) => $(id).disabled = false);
   });
-  socket.on("turn", (p) => enqueueTurn(p));
+  socket.on("audio", (p) => playChunk(p.data));
   socket.on("tts_audio", (p) => playEncoded(p.data).catch((e) => line("sys", "⚠ tts playback: " + e.message)));
   socket.on("transcript", (p) => {
     if (p.role === "user") {

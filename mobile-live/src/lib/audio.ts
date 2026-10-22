@@ -220,6 +220,11 @@ export class GuidancePlayer {
 
   private ensure(): AudioContext {
     if (!this.ctx) this.ctx = new AudioContext({ sampleRate: OUTPUT_RATE });
+    // Like the other players here, resume a context that starts suspended — on
+    // mobile the audio session often begins suspended, which would leave the
+    // scanner's PCM guidance scheduled but silent (the primary feature for a
+    // visually-impaired user relies on hearing it).
+    if (this.ctx.state === "suspended") void this.ctx.resume();
     return this.ctx;
   }
 
