@@ -8,8 +8,10 @@ import {
   useCameraPermission,
 } from "react-native-vision-camera";
 import { io, type Socket } from "socket.io-client";
+import { useIsFocused } from "@react-navigation/native";
 import { sizes, theme } from "../components/theme";
-import { DEMO_UID, LANGUAGE, SERVER_URL } from "../config";
+import { DEMO_UID, SERVER_URL } from "../config";
+import { useLanguage } from "../context/language";
 import { announce, resetAnnouncements } from "../lib/a11y";
 import { base64ToBytes } from "../lib/base64";
 import { EncodedGuidancePlayer, GuidancePlayer } from "../lib/audio";
@@ -42,6 +44,13 @@ interface ScanResult {
 export function ScannerScreen() {
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice("back");
+  // Native-stack keeps screens mounted, so drive the camera off focus rather
+  // than a hardcoded `true` — this reliably (re)starts the preview + video
+  // pipeline when the Scanner is shown and releases the camera when it isn't.
+  const isFocused = useIsFocused();
+  // Language is fixed on the server at connect time, so re-open the socket when
+  // it changes (the effect below keys on it). See context/language.tsx.
+  const { language } = useLanguage();
 
   const [status, setStatus] = useState("Starting camera…");
   const [result, setResult] = useState<ScanResult | null>(null);
@@ -69,7 +78,7 @@ export function ScannerScreen() {
     })();
     return () => stop();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission]);
+  }, [hasPermission, language]);
 
   function start() {
     stop();
@@ -83,7 +92,7 @@ export function ScannerScreen() {
     ttsRef.current = tts;
 
     const socket = io(SERVER_URL + "/scanner-live", {
-      auth: { uid: DEMO_UID, language: LANGUAGE },
+      auth: { uid: DEMO_UID, language },
       transports: ["websocket"],
     });
     socketRef.current = socket;
@@ -98,8 +107,10 @@ export function ScannerScreen() {
       // Speak each new guidance phrase; the audio cue plays too, but this also
       // covers the Twi path and keeps TalkBack in sync.
       if (r.status === "success") {
-        const m = r.prescription_match?.medication;
-        announce(m ? `Found ${m.name}. ${m.unitsPerDose} ${m.dosage}.` : "Label read, but no matching prescription on file.");
+        // The full result is now spoken through the audio channel (Gemini in
+        // English, GhanaNLP TTS in Twi), so keep the screen-reader cue brief to
+        // avoid talking over it — just flag that the read succeeded.
+        announce(r.prescription_match ? "Label read." : "Label read, but no matching prescription on file.");
       } else if (r.guidance_text) {
         announce(r.guidance_text);
       }
@@ -167,8 +178,12 @@ export function ScannerScreen() {
             ref={cameraRef}
             style={StyleSheet.absoluteFill}
             device={device}
-            isActive
-            photo
+            isActive={isFocused}
+            // `video` is REQUIRED for takeSnapshot: on iOS takeSnapshot grabs the
+            // latest frame from the video pipeline (nil → snapshot-failed if video
+            // is off — the reason the scanner never captured frames); on Android
+            // it screenshots the preview. We never call takePhoto, so no `photo`.
+            video={true}
           />
         ) : (
           <Text style={styles.hint}>{status}</Text>

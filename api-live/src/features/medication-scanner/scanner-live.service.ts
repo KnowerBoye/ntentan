@@ -46,6 +46,7 @@ import {
   MedScannerStatus,
   MedScannerPositioningResponse,
   MedScannerSuccessResponse,
+  PrescriptionMatch,
 } from "@/types/medscanner";
 import { extractMedicationFields, findBestMatch } from "@features/medication-scanner/medscanner.match";
 import { prebakedGuidance } from "@features/medication-scanner/twi-guidance";
@@ -128,8 +129,9 @@ For EVERY frame you MUST do BOTH of the following, in the same turn:
   1. SPEAK one short, friendly sentence aloud (under ~12 words) telling the user
      what to do right now. This is the user's live voice guide.
   2. Call the report_guidance tool exactly once with the structured assessment.
-The spoken sentence and the guidance_text you report MUST say the same thing, so
-what the user hears always matches what they see.
+For no_object and positioning, the spoken sentence and the guidance_text you
+report MUST say the same thing, so what the user hears always matches what they
+see.
 
 report_guidance statuses:
 - status "no_object"   → no medication visible in the frame.
@@ -137,7 +139,11 @@ report_guidance statuses:
     set instruction to ONE movement cue and give a short guidance_text.
 - status "success"     → label is clearly readable; set instruction to "none",
     and include medication.drug_name plus medication.raw_label_text (every
-    readable line of text on the label).
+    readable line of text on the label). Keep guidance_text to a brief
+    confirmation (e.g. "I can read the label now."). The tool response for a
+    success contains a "say" field holding the user's matched prescription — the
+    final result. SPEAK that "say" text aloud, word for word, clearly and warmly;
+    it is the answer the user is waiting to hear. Do not add anything else.
 
 Give only ONE instruction at a time. Use instruction "none" for no_object and
 success. Keep guidance_text to one short, friendly sentence. Speak naturally and
@@ -179,6 +185,22 @@ const GUIDANCE_TOOL = {
     },
   ],
 };
+
+// Compose the spoken final result from the authoritative prescription match.
+// This is what the user hears when a label is successfully read — the medication
+// name, strength, and how to take it — phrased the same way the on-screen match
+// is (unitsPerDose + dosage). A null match still speaks, so the user is never
+// left wondering whether the scan worked.
+function buildResultSpeech(match: PrescriptionMatch | null): string {
+  if (!match?.medication) {
+    return "I read the label, but it doesn't match any prescription on your file.";
+  }
+  const m = match.medication;
+  const bits: string[] = [`This is ${m.name}${m.strength ? ` ${m.strength}` : ""}.`];
+  if (m.unitsPerDose && m.dosage) bits.push(`Take ${m.unitsPerDose} ${m.dosage}.`);
+  if (m.instruction) bits.push(/[.!?]$/.test(m.instruction.trim()) ? m.instruction.trim() : `${m.instruction.trim()}.`);
+  return bits.join(" ");
+}
 
 export async function handleScannerLiveConnection(socket: Socket): Promise<void> {
   const uid = socket.user?.uid;
@@ -368,8 +390,13 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
           medication?: { drug_name?: string; raw_label_text?: string[] };
         };
 
+        // The tool response is normally just an ack, but on a success read it
+        // carries a `say` field with the matched prescription — the final result
+        // the model must speak aloud (English streams back as native audio, the
+        // same channel as the spoken guidance). handleGuidance builds it.
+        let toolResponse: { ok: true; say?: string } = { ok: true };
         try {
-          await handleGuidance(args);
+          toolResponse = await handleGuidance(args);
         } catch (err) {
           logger.warn("Scanner-live: failed to handle guidance", {
             socketId: socket.id,
@@ -380,7 +407,7 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
         // Acknowledge the tool call so the model proceeds (and then speaks).
         try {
           session.sendToolResponse({
-            functionResponses: [{ id: call.id, name: call.name, response: { ok: true } }],
+            functionResponses: [{ id: call.id, name: call.name, response: toolResponse }],
           });
         } catch {
           /* session may have closed */
@@ -445,18 +472,20 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
     instruction?: string;
     guidance_text?: string;
     medication?: { drug_name?: string; raw_label_text?: string[] };
-  }): Promise<void> {
+  }): Promise<{ ok: true; say?: string }> {
     const status = args.status as MedScannerStatus | undefined;
     const guidance_text = args.guidance_text ?? "";
-    if (!status || !socket.connected) return;
+    if (!status || !socket.connected) return { ok: true };
     lastStatus = status;
 
     if (status === "success") {
-      // Debounce the expensive extraction + vector search.
-      if (Date.now() - lastSuccessAt < SUCCESS_COOLDOWN_MS) return;
+      // Debounce the expensive extraction + vector search. A repeat success on
+      // the same label must also stay quiet, so acknowledge without a `say` —
+      // no result is re-spoken while the label keeps sitting in frame.
+      if (Date.now() - lastSuccessAt < SUCCESS_COOLDOWN_MS) return { ok: true };
 
       const drug_name = args.medication?.drug_name;
-      if (!drug_name) return;
+      if (!drug_name) return { ok: true };
 
       const fields = await extractMedicationFields({
         drug_name,
@@ -464,19 +493,36 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
       });
       const match = await findBestMatch(uid!, fields);
 
-      // Protect drug names in the spoken Twi success message.
+      // The spoken final result, built server-side from the authoritative
+      // prescription match (the model can't know it — it only read the label).
+      const resultSpeech = buildResultSpeech(match);
+
       if (isTwi) {
+        // Twi discards the model's native audio, so the result is spoken through
+        // GhanaNLP: translate + synthesize the result sentence and send it as
+        // tts_audio (and show it as the Twi guidance_text). Protect drug names.
         drugLexicon.add(drug_name.trim());
         if (match?.medication?.name) drugLexicon.add(match.medication.name.trim());
+        await emitLocalized(
+          { status: "success", instruction: "none", guidance_text: resultSpeech, prescription_match: match },
+          null, // no pre-baked asset — success text varies (live pipeline)
+          true // always speak the result
+        );
+        lastSuccessAt = Date.now();
+        return { ok: true };
       }
 
-      await emitLocalized(
-        { status: "success", instruction: "none", guidance_text, prescription_match: match },
-        null, // no pre-baked asset — success text varies (live pipeline)
-        true // always speak the result
-      );
+      // English: emit the structured response now (brief guidance_text + the
+      // match for display); the model speaks the result via the `say` field of
+      // this tool response, streamed back as native audio like the guidance.
+      emitMedScannerResponse(socket, {
+        status: "success",
+        instruction: "none",
+        guidance_text,
+        prescription_match: match,
+      });
       lastSuccessAt = Date.now();
-      return;
+      return { ok: true, say: resultSpeech };
     }
 
     if (status === "positioning" || status === "no_object") {
@@ -489,6 +535,7 @@ export async function handleScannerLiveConnection(socket: Socket): Promise<void>
       const prebakeKey = status === "no_object" ? "no_object" : instruction;
       await emitLocalized({ status, instruction, guidance_text }, prebakeKey);
     }
+    return { ok: true };
   }
 
   // Emit a guidance response, localized for Twi. English passes straight

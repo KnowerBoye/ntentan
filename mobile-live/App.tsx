@@ -2,6 +2,7 @@ import { DarkTheme, NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { StatusBar } from "expo-status-bar";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { LanguageProvider } from "./src/context/language";
 import { theme } from "./src/components/theme";
 import type { RootStackParamList } from "./src/navigation";
 import { AlertScreen } from "./src/screens/AlertScreen";
@@ -29,7 +30,8 @@ export function App() {
   return (
     <SafeAreaProvider>
       <StatusBar style="light" />
-      <NavigationContainer theme={navTheme}>
+      <LanguageProvider>
+        <NavigationContainer theme={navTheme}>
         <Stack.Navigator
           screenOptions={{
             headerTitleStyle: { fontSize: 24, fontWeight: "800" },
@@ -59,7 +61,8 @@ export function App() {
             options={{ title: "Emergency alert" }}
           />
         </Stack.Navigator>
-      </NavigationContainer>
+        </NavigationContainer>
+      </LanguageProvider>
     </SafeAreaProvider>
   );
 }

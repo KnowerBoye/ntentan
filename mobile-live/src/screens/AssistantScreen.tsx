@@ -3,7 +3,8 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { io, type Socket } from "socket.io-client";
 import { sizes, theme } from "../components/theme";
-import { DEMO_UID, LANGUAGE, SERVER_URL } from "../config";
+import { DEMO_UID, SERVER_URL } from "../config";
+import { useLanguage } from "../context/language";
 import { announce, resetAnnouncements } from "../lib/a11y";
 import { EncodedPlayer, Player, Recorder } from "../lib/audio";
 
@@ -19,9 +20,13 @@ interface Msg {
 //         barge-in handle turn-taking). Big button says "End conversation".
 type Phase = "idle" | "connecting" | "live";
 
-const IS_TWI = LANGUAGE === "tw";
-
 export function AssistantScreen() {
+  // Language is chosen app-wide (Home) and fixed on the server when the socket
+  // connects — so we read it here and use it for the next session the user
+  // starts. See context/language.tsx.
+  const { language } = useLanguage();
+  const isTwi = language === "tw";
+
   const [phase, setPhase] = useState<Phase>("idle");
   const [status, setStatus] = useState(
     "Tap the button to start talking with the assistant."
@@ -98,7 +103,7 @@ export function AssistantScreen() {
     ttsRef.current = tts;
 
     const socket = io(SERVER_URL + "/assistant-live", {
-      auth: { uid: DEMO_UID, language: LANGUAGE },
+      auth: { uid: DEMO_UID, language },
       transports: ["websocket"],
     });
     socketRef.current = socket;
@@ -156,7 +161,7 @@ export function AssistantScreen() {
       recorderRef.current = rec;
       setPhase("live");
       setAndSay(
-        IS_TWI
+        isTwi
           ? "Ready. Speak, then tap ‘Finish speaking’ to send."
           : "Listening. Just speak — you can talk over the assistant to interrupt."
       );
@@ -171,7 +176,7 @@ export function AssistantScreen() {
     if (endingRef.current) return;
     endingRef.current = true;
     // Flush any buffered Twi utterance before closing, so nothing is left hanging.
-    if (IS_TWI) socketRef.current?.emit("audio_end");
+    if (isTwi) socketRef.current?.emit("audio_end");
     teardown();
     setPhase("idle");
     setSpeaking(false);
@@ -198,11 +203,7 @@ export function AssistantScreen() {
           scrollRef.current?.scrollToEnd({ animated: true })
         }
       >
-        {messages.length === 0 && (
-          <Text style={styles.hint}>
-            Try: “What should I take next?” or “What is paracetamol for?”
-          </Text>
-        )}
+
         {messages.map((m) => (
           <View key={m.id} style={[styles.bubble, bubbleStyle(m.role)]}>
             <Text style={styles.bubbleRole}>{roleLabel(m.role)}</Text>
@@ -221,7 +222,7 @@ export function AssistantScreen() {
         </Text>
 
         {/* Twi only: an explicit end-of-turn tap (no live VAD in Twi). */}
-        {live && IS_TWI && (
+        {live && isTwi && (
           <Pressable
             onPress={finishTurn}
             style={({ pressed }) => [

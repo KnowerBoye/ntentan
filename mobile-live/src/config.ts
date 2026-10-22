@@ -23,7 +23,12 @@ export const DEMO_UID = "GgCTd5OjRWO5jTJrq9jvkjkk5LM2";
  */
 export const SERVER_URL = "https://ntentan-api-live-209385824341.us-west1.run.app";
 
-/** Assistant / scanner language: "en" (English) or "tw" (Twi / Akan). */
+/**
+ * Initial assistant / scanner language: "en" (English) or "tw" (Twi / Akan).
+ * This is only the DEFAULT seed — at runtime the language is chosen with the
+ * toggle on the Home screen and persisted (see src/context/language.tsx), so
+ * screens read it from the LanguageProvider, not this constant.
+ */
 export const LANGUAGE: "en" | "tw" = "en";
 
 // ── Live API fixed audio formats (do not change) ──

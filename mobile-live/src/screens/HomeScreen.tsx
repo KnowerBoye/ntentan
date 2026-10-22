@@ -2,6 +2,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Tile } from "../components/Tile";
+import { LanguageToggle } from "../components/LanguageToggle";
 import { sizes, theme } from "../components/theme";
 import type { RootStackParamList } from "../navigation";
 
@@ -43,6 +44,9 @@ export function HomeScreen({ navigation }: Props) {
             onPress={() => navigation.navigate("Alert")}
           />
         </View>
+
+        {/* App-wide language choice. Takes effect when you next open a feature. */}
+        <LanguageToggle />
       </ScrollView>
     </SafeAreaView>
   );
