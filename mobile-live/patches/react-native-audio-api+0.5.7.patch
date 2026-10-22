@@ -19,3 +19,29 @@ index 4d82dca..7494862 100644
  
  // general
  static constexpr float MOST_POSITIVE_SINGLE_FLOAT = static_cast<float>(std::numeric_limits<float>::max());
+diff --git a/node_modules/react-native-audio-api/ios/audioapi/ios/core/AudioPlayer.m b/node_modules/react-native-audio-api/ios/audioapi/ios/core/AudioPlayer.m
+index 39c1047..8ae9a34 100644
+--- a/node_modules/react-native-audio-api/ios/audioapi/ios/core/AudioPlayer.m
++++ b/node_modules/react-native-audio-api/ios/audioapi/ios/core/AudioPlayer.m
+@@ -122,9 +122,18 @@ - (void)setupAndInitAudioSession
+     self.audioSession = [AVAudioSession sharedInstance];
+   }
+ 
+-  [self.audioSession setCategory:AVAudioSessionCategoryPlayback
+-                            mode:AVAudioSessionModeDefault
+-                         options:AVAudioSessionCategoryOptionDuckOthers | AVAudioSessionCategoryOptionAllowAirPlay
++  // PlayAndRecord + VoiceChat so playback shares the voice-processing session
++  // the recorder uses: this keeps hardware acoustic echo cancellation active
++  // while the assistant speaks (otherwise the open mic loops the reply back).
++  // DefaultToSpeaker keeps hands-free output on the loudspeaker. Must match
++  // react-native-audio-record's RNAudioRecord session, or the two libs fight
++  // over the shared AVAudioSession. (Was: Playback / ModeDefault / AllowAirPlay —
++  // AllowAirPlay is invalid with PlayAndRecord.)
++  [self.audioSession setCategory:AVAudioSessionCategoryPlayAndRecord
++                            mode:AVAudioSessionModeVoiceChat
++                         options:AVAudioSessionCategoryOptionDefaultToSpeaker
++                                 | AVAudioSessionCategoryOptionAllowBluetooth
++                                 | AVAudioSessionCategoryOptionAllowBluetoothA2DP
+                            error:&error];
+ 
+   if (error != nil) {

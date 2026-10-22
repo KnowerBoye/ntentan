@@ -20,6 +20,16 @@ import {
 import { INPUT_RATE, OUTPUT_RATE } from "../config";
 import { base64ToBytes } from "./base64";
 
+// Android mic source. 7 = MediaRecorder.AudioSource.VOICE_COMMUNICATION, which
+// routes capture through the platform's voice pre-processing — hardware acoustic
+// echo cancellation (AEC) + noise suppression + auto gain — the same path VoIP
+// apps use. This stops the always-open assistant mic from re-capturing the
+// assistant's own spoken reply out of the loudspeaker (the feedback loop).
+// (6 = VOICE_RECOGNITION is tuned for ASR and applies NO echo cancellation.)
+// iOS gets the equivalent from the AVAudioSession PlayAndRecord + VoiceChat mode
+// set in the patched native audio libs (patches/*.patch).
+const ANDROID_SOURCE_VOICE_COMMUNICATION = 7;
+
 // ── PCM16 base64 -> Float32 [-1, 1] ──
 function pcm16Base64ToFloat32(b64: string): Float32Array {
   const bytes = base64ToBytes(b64);
@@ -56,7 +66,7 @@ export class Recorder {
       sampleRate: INPUT_RATE,
       channels: 1,
       bitsPerSample: 16,
-      audioSource: 6, // Android VOICE_RECOGNITION — tuned for speech
+      audioSource: ANDROID_SOURCE_VOICE_COMMUNICATION, // AEC/NS/AGC — no echo loop
       wavFile: "", // streaming only; no file written
     });
     // AudioRecord.on returns a subscription; keep it so we can detach on stop.
