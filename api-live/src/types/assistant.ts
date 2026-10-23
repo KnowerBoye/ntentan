@@ -143,6 +143,50 @@ export interface DeletePrescriptionInput {
   prescriptionId: string;
 }
 
+// ── Hardware sync ────────────────────────────
+/** One prescription pushed up by the device during a sync. */
+export interface SyncPrescriptionInput {
+  /** Server id when previously synced; omitted for an offline-created item. */
+  id?: string;
+  /** Device-local id, echoed back so the device can map it to the server id. */
+  clientId?: string;
+  name?: string;
+  timeSlots?: string[];
+  dosage?: string;
+  unitsPerDose?: number;
+  frequency?: number;
+  strength?: string;
+  instruction?: string;
+  /** Doses the device marked taken while offline. Always merged, never cleared. */
+  completions?: Completions;
+  /** Tombstone — the device deleted this prescription offline. */
+  deleted?: boolean;
+  /** Device last-modified time, used for last-write-wins on editable fields. */
+  updatedAt?: string;
+}
+
+/** Per-item outcome of a sync push. */
+export interface SyncItemResult {
+  /** Echo of the device-local id, when supplied. */
+  clientId?: string;
+  /** Server id of the affected prescription (null when skipped and unresolved). */
+  id: string | null;
+  action: "created" | "updated" | "deleted" | "skipped";
+  /** Why the item was skipped (e.g. "not_found"). */
+  reason?: string;
+}
+
+export interface SyncPushResult {
+  serverTime: string;
+  applied: number;
+  results: SyncItemResult[];
+}
+
+export interface SyncSnapshot {
+  serverTime: string;
+  prescriptions: Prescription[];
+}
+
 // ── Shared tool result ───────────────────────
 export interface ToolResult<T = unknown> {
   success: boolean;

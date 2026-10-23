@@ -21,6 +21,10 @@ import {
   TodayScheduleResult,
   TimeSlot,
   VALID_SLOTS,
+  SyncPrescriptionInput,
+  SyncItemResult,
+  SyncPushResult,
+  SyncSnapshot,
 } from "@/types/assistant";
 
 const medicationsCol = (userId: string) =>
@@ -140,4 +144,161 @@ export async function getDaySchedule(
     .map((p) => buildMedicationDayView(p, date))
     .sort((a, b) => a.name.localeCompare(b.name));
   return { date, medications };
+}
+
+// ── Hardware sync ────────────────────────────
+
+/**
+ * Full snapshot the device pulls on reconnect: every prescription with its
+ * complete state (intake `completions`, `createdAt`/`updatedAt`) plus a
+ * `serverTime` the device can keep as its last-synced marker. The embedding
+ * vector is stripped — the device never needs it.
+ */
+export async function getSyncSnapshot(userId: string): Promise<SyncSnapshot> {
+  const all = await fetchAll(userId);
+  const prescriptions = all.map(
+    ({ name_embedding, ...rest }) => rest as Prescription
+  );
+  return { serverTime: new Date().toISOString(), prescriptions };
+}
+
+/**
+ * Apply a batch of offline changes the device accumulated while disconnected.
+ * Everything is committed in a single Firestore batch, so the push is all or
+ * nothing. Per item:
+ *
+ *   • no `id`            → create a new prescription (server mints the id and
+ *                          echoes it back against the device's `clientId`).
+ *   • `id` + fields      → update an existing prescription.
+ *   • `id` + `deleted`   → delete it.
+ *
+ * Conflict policy: editable fields use last-write-wins on `updatedAt` (the
+ * device only wins when its clock is at/after the server's last write), while
+ * `completions` are always merged — a dose recorded as taken is never dropped
+ * by a sync. An `id` the server no longer knows is skipped (`not_found`) rather
+ * than resurrected, so a server-side deletion is not undone.
+ */
+export async function syncPrescriptions(
+  userId: string,
+  incoming: SyncPrescriptionInput[]
+): Promise<SyncPushResult> {
+  const db = getFirestore();
+  const col = medicationsCol(userId);
+
+  // One read of current server state for existence + last-write-wins checks.
+  const existing = await fetchAll(userId);
+  const byId = new Map(existing.map((p) => [p.id, p]));
+
+  const batch = db.batch();
+  const results: SyncItemResult[] = [];
+  const now = new Date().toISOString();
+  let applied = 0;
+
+  for (const item of incoming) {
+    // ── Tombstone: deleted offline ──
+    if (item.deleted) {
+      if (item.id && byId.has(item.id)) {
+        batch.delete(col.doc(item.id));
+        results.push({ clientId: item.clientId, id: item.id, action: "deleted" });
+        applied++;
+      } else {
+        results.push({
+          clientId: item.clientId,
+          id: item.id ?? null,
+          action: "skipped",
+          reason: "not_found",
+        });
+      }
+      continue;
+    }
+
+    if (item.timeSlots) assertValidSlots(item.timeSlots);
+
+    // ── Update an existing prescription ──
+    if (item.id) {
+      const current = byId.get(item.id);
+      if (!current) {
+        // Deleted server-side since the device last synced — don't resurrect.
+        results.push({
+          clientId: item.clientId,
+          id: item.id,
+          action: "skipped",
+          reason: "not_found",
+        });
+        continue;
+      }
+
+      const deviceWins =
+        !item.updatedAt || !current.updatedAt || item.updatedAt >= current.updatedAt;
+
+      // Device lost the race on fields and has no new doses to record — no-op.
+      if (!deviceWins && !item.completions) {
+        results.push({
+          clientId: item.clientId,
+          id: item.id,
+          action: "skipped",
+          reason: "stale",
+        });
+        continue;
+      }
+
+      const merge: Record<string, unknown> = { updatedAt: now };
+
+      if (deviceWins) {
+        for (const key of [
+          "name",
+          "timeSlots",
+          "dosage",
+          "unitsPerDose",
+          "frequency",
+          "strength",
+          "instruction",
+        ] as const) {
+          if (item[key] !== undefined) merge[key] = item[key];
+        }
+        const name = (merge.name as string) ?? current.name;
+        const strength = (merge.strength as string) ?? current.strength ?? "";
+        const dosage = (merge.dosage as string) ?? current.dosage;
+        merge.composite_string = `${name} ${strength} ${dosage}`.trim();
+      }
+
+      // Deep-merged by Firestore: existing days/slots are preserved, incoming
+      // ones added — the union of taken doses across all clients.
+      if (item.completions) merge.completions = item.completions;
+
+      batch.set(col.doc(item.id), merge, { merge: true });
+      results.push({ clientId: item.clientId, id: item.id, action: "updated" });
+      applied++;
+      continue;
+    }
+
+    // ── Create a new (offline-born) prescription ──
+    const ref = col.doc();
+    batch.set(ref, {
+      name: item.name,
+      timeSlots: item.timeSlots,
+      dosage: item.dosage,
+      unitsPerDose: item.unitsPerDose,
+      frequency: item.frequency,
+      strength: item.strength ?? "",
+      instruction: item.instruction ?? "",
+      completions: item.completions ?? {},
+      composite_string: `${item.name} ${item.strength ?? ""} ${item.dosage}`.trim(),
+      createdAt: now,
+      updatedAt: now,
+    });
+    results.push({ clientId: item.clientId, id: ref.id, action: "created" });
+    applied++;
+  }
+
+  await batch.commit();
+  logger.info("Hardware sync committed", {
+    userId,
+    received: incoming.length,
+    applied,
+  });
+
+  // Embeddings for any created/renamed docs are produced by the
+  // embedMedicationOnWrite Cloud Function that fires on these writes.
+  return { serverTime: now, applied, results };
 }

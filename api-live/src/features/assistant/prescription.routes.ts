@@ -16,6 +16,11 @@
 //    DELETE /:id              delete a prescription
 //    GET    /today?date=      day schedule w/ taken/upcoming/missed per slot
 //    POST   /:id/taken        mark (or undo) a dose taken
+//    GET    /sync             full snapshot the hardware client pulls on reconnect
+//    POST   /sync             bulk push of offline changes from the hardware client
+//
+//  The /sync pair is the offline-first sync surface for the hardware device.
+//  See docs/HARDWARE_SYNC.md for the contract and reconciliation flow.
 // ─────────────────────────────────────────────
 import { Router } from "express";
 import { authMiddleware } from "@middlewares/auth.middleware";
@@ -27,6 +32,7 @@ import {
   DeletePrescriptionSchema,
   MarkTakenSchema,
   TodayScheduleSchema,
+  SyncPushSchema,
 } from "@features/assistant/prescription.schema";
 import {
   listPrescriptions,
@@ -34,12 +40,15 @@ import {
   updatePrescription,
   deletePrescription,
   getDaySchedule,
+  getSyncSnapshot,
+  syncPrescriptions,
 } from "@features/assistant/prescription.service";
 import { markMedicationTaken } from "@features/assistant/prescription.tools";
 import { BadRequestError } from "@/lib/errors";
 import {
   PrescriptionFields,
   TimeSlot,
+  SyncPrescriptionInput,
 } from "@/types/assistant";
 
 const router = Router();
@@ -52,6 +61,28 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const data = await listPrescriptions(req.user!.uid);
+    res.json({ status: "success", data });
+  })
+);
+
+// ── Hardware sync: pull full snapshot ─────────
+router.get(
+  "/sync",
+  asyncHandler(async (req, res) => {
+    const data = await getSyncSnapshot(req.user!.uid);
+    res.json({ status: "success", data });
+  })
+);
+
+// ── Hardware sync: push offline changes ───────
+router.post(
+  "/sync",
+  validate(SyncPushSchema),
+  asyncHandler(async (req, res) => {
+    const { prescriptions } = req.validated!.body as {
+      prescriptions: SyncPrescriptionInput[];
+    };
+    const data = await syncPrescriptions(req.user!.uid, prescriptions);
     res.json({ status: "success", data });
   })
 );
